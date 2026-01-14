@@ -13,6 +13,10 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    environment: npm-publish
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -33,6 +37,12 @@ jobs:
 
       - name: Build package
         run: bun run build
+
+      - name: Setup Node.js with npm registry
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
 
       - name: Determine version and tag
         id: version
@@ -59,9 +69,7 @@ jobs:
           echo "📦 Publishing public release to NPM"
 
       - name: Publish to NPM
-        run: npm publish --tag ${{ steps.version.outputs.tag }}
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --tag ${{ steps.version.outputs.tag }}
 
       - name: Create GitHub release (for manual pushes to main/master)
         if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
