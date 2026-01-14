@@ -1,0 +1,57 @@
+{
+  "name": "@endevre/entry-on-kitchen",
+  "version": "0.3.0",
+  "description": "Official JavaScript/TypeScript library for Entry on Kitchen API",
+  "repository": "endevre/entry-on-kitchen-npm",
+  "license": "ISC",
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "prepack": "bun run build",
+    "prepublishOnly": "bun run build",
+    "release": "npm version patch && git push origin main --tags",
+    "release:minor": "npm version minor && git push origin main --tags",
+    "release:major": "npm version major && git push origin main --tags",
+    "release:beta": "npm version prerelease --preid=beta && npm publish --tag beta",
+    "release:alpha": "npm version prerelease --preid=alpha && npm publish --tag alpha"
+  },
+  "keywords": [
+    "kitchen",
+    "entry-on-kitchen",
+    "endevre",
+    "api",
+    "pipeline",
+    "streaming"
+  ],
+  "author": "Endevre Technologies",
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "jsdom": "^24.0.0",
+    "tsup": "^8.0.1",
+    "typescript": "^5.3.3",
+    "vitest": "^1.2.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
