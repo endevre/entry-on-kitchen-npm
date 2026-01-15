@@ -311,7 +311,6 @@ export class KitchenClient {
     // The API returns either:
     // 1. Server-Sent Events with "data:" prefix: data:{...}data:{...}
     // 2. Raw concatenated JSON objects: {...}{...}{...}
-    // Reference implementation approach: split on "data:" and "}{"
     const reader = response.body?.getReader();
     if (!reader) {
       throw new Error("No response body");
@@ -320,52 +319,153 @@ export class KitchenClient {
     const decoder = new TextDecoder();
     let buffer = "";
 
+    // Helper function to extract complete JSON objects from buffer
+    function extractCompleteJsonObjects(input: string): string[] {
+      const objects: string[] = [];
+      let depth = 0;
+      let inString = false;
+      let escapeNext = false;
+      let startIdx = -1;
+
+      for (let i = 0; i < input.length; i++) {
+        const char = input[i];
+
+        if (escapeNext) {
+          escapeNext = false;
+          continue;
+        }
+
+        if (char === "\\") {
+          escapeNext = true;
+          continue;
+        }
+
+        if (char === '"') {
+          inString = !inString;
+          continue;
+        }
+
+        if (!inString) {
+          if (char === "{") {
+            if (depth === 0) {
+              startIdx = i;
+            }
+            depth++;
+          } else if (char === "}") {
+            depth--;
+            if (depth === 0 && startIdx !== -1) {
+              objects.push(input.substring(startIdx, i + 1));
+              startIdx = -1;
+            }
+          }
+        }
+      }
+
+      return objects;
+    }
+
     try {
       while (true) {
         const { done, value } = await reader.read();
 
+        // Decode chunk and accumulate
+        if (value) {
+          buffer += decoder.decode(value, { stream: true });
+        }
+
         if (done) {
+          // Process any remaining data in buffer
+          if (buffer.trim()) {
+            // Try SSE format first
+            const lines = buffer.split("data:");
+            for (const line of lines) {
+              const trimmedLine = line.trim();
+              if (!trimmedLine) {
+                continue;
+              }
+
+              try {
+                const obj = JSON.parse(trimmedLine);
+                yield obj as StreamEvent;
+              } catch {
+                // Try concatenated format
+                const objects = extractCompleteJsonObjects(trimmedLine);
+                for (const objStr of objects) {
+                  try {
+                    const obj = JSON.parse(objStr);
+                    yield obj as StreamEvent;
+                  } catch {
+                    // Skip invalid JSON
+                  }
+                }
+              }
+            }
+          }
           break;
         }
 
-        // Decode chunk and accumulate
-        buffer += decoder.decode(value, { stream: true });
-      }
+        // Try to parse and yield complete objects as they arrive
+        // SSE format: split by "data:" and try to parse each complete line
+        if (buffer.includes("data:")) {
+          const lines = buffer.split("data:");
+          let allButLastComplete = true;
 
-      // Process all accumulated data
-      // The API returns either:
-      // 1. SSE format: data:{...}\ndata:{...} (each line is valid JSON)
-      // 2. Concatenated JSON: {...}{...}{...} (no separators)
-      const lines = buffer.split("data:");
+          // Check if the last line is complete (ends with } or ])
+          const lastLine = lines[lines.length - 1];
+          const lastLineTrimmed = lastLine.trim();
+          if (lastLineTrimmed && !lastLineTrimmed.endsWith("}") && !lastLineTrimmed.endsWith("]")) {
+            allButLastComplete = false;
+          }
 
-      for (const line of lines) {
-        const trimmedLine = line.trim();
-        if (!trimmedLine) {
-          continue;
-        }
+          // Process all complete lines
+          const linesToProcess = allButLastComplete ? lines.length : lines.length - 1;
+          let processedChars = 0;
 
-        try {
-          // Try parsing as single JSON object (SSE format)
-          const obj = JSON.parse(trimmedLine);
-          yield obj as StreamEvent;
-        } catch {
-          // If that fails, try splitting on "}{" (concatenated format)
-          const splitValues = trimmedLine.split("}{");
-          for (let i = 0; i < splitValues.length; i++) {
-            // Reconstruct JSON by adding back braces
-            const reconstructed =
-              (i > 0 ? "{" : "") +
-              splitValues[i] +
-              (i < splitValues.length - 1 ? "}" : "");
+          for (let i = 0; i < linesToProcess; i++) {
+            const line = lines[i].trim();
+            if (line) {
+              try {
+                const obj = JSON.parse(line);
+                yield obj as StreamEvent;
+              } catch {
+                // Try concatenated format
+                const objects = extractCompleteJsonObjects(line);
+                for (const objStr of objects) {
+                  try {
+                    const obj = JSON.parse(objStr);
+                    yield obj as StreamEvent;
+                  } catch {
+                    // Skip invalid JSON
+                  }
+                }
+              }
+            }
+            processedChars += line.length + 5; // +5 for "data:"
+          }
 
+          // Remove processed data from buffer
+          if (processedChars > 0 && processedChars < buffer.length) {
+            buffer = buffer.substring(processedChars);
+          } else if (linesToProcess === lines.length) {
+            buffer = "";
+          }
+        } else {
+          // No SSE format, try concatenated JSON
+          const objects = extractCompleteJsonObjects(buffer);
+          let lastEndIdx = 0;
+
+          for (const objStr of objects) {
             try {
-              const obj = JSON.parse(reconstructed);
+              const obj = JSON.parse(objStr);
               yield obj as StreamEvent;
+              lastEndIdx += objStr.length;
             } catch {
               // Skip invalid JSON
-              continue;
             }
           }
+
+          // Keep unprocessed data in buffer
+          buffer = buffer.substring(lastEndIdx);
         }
       }
     } finally {
