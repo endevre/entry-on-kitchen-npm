@@ -172,10 +172,19 @@ export class KitchenClient {
 
     // Add KITCHEN_MODELS_OVERRIDE if llmOverride is specified
     if (llmOverride) {
+      const existingModelOverrides =
+        bodyObj &&
+        typeof bodyObj === "object" &&
+        "KITCHEN_MODELS_OVERRIDE" in (bodyObj as Record<string, unknown>) &&
+        typeof (bodyObj as Record<string, unknown>).KITCHEN_MODELS_OVERRIDE === "object"
+          ? ((bodyObj as Record<string, unknown>).KITCHEN_MODELS_OVERRIDE as Record<string, unknown>)
+          : {};
+
       bodyObj = {
         ...((bodyObj as Record<string, unknown>) || {}),
         KITCHEN_MODELS_OVERRIDE: {
-          llm_override: llmOverride,
+          ...existingModelOverrides,
+          models__llm_override: llmOverride,
         },
       };
     }

@@ -119,6 +119,35 @@ describe("KitchenClient", () => {
 
       expect(mockFetch).toHaveBeenCalled();
     });
+
+    it("should serialize llmOverride using models__llm_override", async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        headers: new Headers(),
+        text: async () => JSON.stringify({ status: "finished" }),
+      });
+
+      await client.sync({
+        recipeId: "test-recipe",
+        entryId: "test-entry",
+        body: { message: "Hello!" },
+        llmOverride: "openai/gpt-5.4",
+      });
+
+      expect(mockFetch).toHaveBeenCalledWith(
+        "https://raydev.entry.on.kitchen/test-recipe/test-entry/sync",
+        expect.objectContaining({
+          body: JSON.stringify({
+            message: "Hello!",
+            KITCHEN_MODELS_OVERRIDE: {
+              models__llm_override: "openai/gpt-5.4",
+            },
+          }),
+        }),
+      );
+    });
   });
 
   describe("stream", () => {
