@@ -1,5 +1,13 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { KitchenClient, applyDelta } from "../client";
+import {
+  createExternalTool,
+  createKitchenEntryTool,
+  createToolResult,
+  getToolCallRequest,
+  withToolResults,
+  withTools,
+} from "../tools";
 import type { DeltaOperation } from "../types";
 
 // Mock fetch globally
@@ -147,6 +155,146 @@ describe("KitchenClient", () => {
           }),
         }),
       );
+    });
+  });
+
+  describe("tools", () => {
+    beforeEach(() => {
+      client = new KitchenClient({ authCode: "test-auth-code", entryPoint: "raydev" });
+    });
+
+    it("should build canonical tool and tool result payloads", () => {
+      const externalTool = createExternalTool({
+        name: "get user plan",
+        description: "Get a user's plan",
+        inputSchema: {
+          type: "object",
+          properties: { userId: { type: "string" } },
+          required: ["userId"],
+        },
+      });
+      const kitchenTool = createKitchenEntryTool({
+        name: "summarize_youtube",
+        description: "Summarize a video",
+        pipelineId: "recipe-1",
+        entryBlockId: "entry-1",
+      });
+      const toolResult = createToolResult({
+        toolCallId: "call-1",
+        name: externalTool.name,
+        output: { plan: "pro" },
+      });
+
+      expect(externalTool.name).toBe("get_user_plan");
+      expect(externalTool.executor.type).toBe("external");
+      expect(kitchenTool.executor.type).toBe("entry");
+      expect(toolResult.status).toBe("success");
+    });
+
+    it("should merge tools and tool results into entry bodies", () => {
+      const tool = createExternalTool({
+        name: "lookup",
+        description: "Lookup something",
+      });
+      const body = withTools({ messages: [] }, [tool]);
+      const resumedBody = withToolResults(
+        { messages: [] },
+        [createToolResult({ toolCallId: "call-1", name: "lookup", output: { ok: true } })],
+        {
+          type: "LLMContinuation",
+          version: 1,
+          provider: "openai",
+          model: "gpt-test",
+          conversation: [],
+        },
+      );
+
+      expect(body.tools).toEqual([tool]);
+      expect(resumedBody.tool_results).toHaveLength(1);
+      expect(resumedBody.continuation).toMatchObject({ provider: "openai" });
+    });
+
+    it("should detect tool call requests from Kitchen responses", () => {
+      const request = getToolCallRequest({
+        status: "finished",
+        result: JSON.stringify({
+          status: "requires_tool_outputs",
+          tool_calls: [
+            {
+              type: "LLMToolCall",
+              version: 1,
+              id: "call-1",
+              name: "lookup",
+              arguments: { id: "123" },
+            },
+          ],
+          continuation: {
+            type: "LLMContinuation",
+            version: 1,
+            provider: "openai",
+            model: "gpt-test",
+            conversation: [],
+          },
+        }),
+      });
+
+      expect(request?.tool_calls[0]?.name).toBe("lookup");
+    });
+
+    it("should execute external tool handlers until completion", async () => {
+      const requestPayload = {
+        status: "requires_tool_outputs",
+        tool_calls: [
+          {
+            type: "LLMToolCall",
+            version: 1,
+            id: "call-1",
+            name: "lookup",
+            arguments: { id: "123" },
+          },
+        ],
+        continuation: {
+          type: "LLMContinuation",
+          version: 1,
+          provider: "openai",
+          model: "gpt-test",
+          conversation: [],
+        },
+      };
+
+      mockFetch
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          headers: new Headers(),
+          text: async () => JSON.stringify({ status: "finished", result: JSON.stringify(requestPayload) }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          headers: new Headers(),
+          text: async () => JSON.stringify({ status: "finished", result: { answer: "done" } }),
+        });
+
+      const result = await client.runWithTools({
+        recipeId: "test-recipe",
+        entryId: "test-entry",
+        body: { messages: [] },
+        tools: [createExternalTool({ name: "lookup", description: "Lookup" })],
+        handlers: {
+          lookup: async (args) => ({ found: args.id }),
+        },
+      });
+
+      expect(result.result).toEqual({ answer: "done" });
+      const secondBody = JSON.parse((mockFetch.mock.calls[1]?.[1] as RequestInit).body as string);
+      expect(secondBody.tool_results[0]).toMatchObject({
+        tool_call_id: "call-1",
+        name: "lookup",
+        status: "success",
+      });
     });
   });
 

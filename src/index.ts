@@ -8,13 +8,36 @@
  */
 
 export { KitchenClient, applyDelta } from "./client";
+export {
+  createExternalTool,
+  createKitchenEntryTool,
+  createToolError,
+  createToolResult,
+  getContinuation,
+  getToolCallRequest,
+  getToolCalls,
+  isToolCallRequest,
+  withToolResults,
+  withTools,
+} from "./tools";
 export type {
+  JSONSchema,
   KitchenClientConfig,
+  KitchenEntryTool,
+  KitchenExternalTool,
   KitchenResponse,
+  KitchenTool,
+  LLMContinuation,
+  LLMToolCall,
+  LLMToolResult,
   SyncParams,
   StreamParams,
   StreamEvent,
   StreamEventType,
+  ToolCallRequest,
+  ToolHandler,
+  ToolHandlerMap,
+  RunWithToolsParams,
   ProgressData,
   HttpResponse,
   DeltaOperation,

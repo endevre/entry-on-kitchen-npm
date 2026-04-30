@@ -7,7 +7,16 @@ import type {
   HttpResponse,
   DeltaOperation,
   OverrideAPIKey,
+  RunWithToolsParams,
+  LLMToolResult,
 } from "./types";
+import {
+  createToolError,
+  createToolResult,
+  getToolCallRequest,
+  withToolResults,
+  withTools,
+} from "./tools";
 
 type HeadersObject = Record<string, string>;
 
@@ -275,6 +284,87 @@ export class KitchenClient {
     }
 
     return response.data as KitchenResponse;
+  }
+
+  /**
+   * Execute a recipe and automatically satisfy external LLM tool calls.
+   *
+   * This helper repeatedly runs the same entry with tool results until Kitchen
+   * returns a completed response or the iteration limit is reached.
+   */
+  async runWithTools(params: RunWithToolsParams): Promise<KitchenResponse> {
+    const {
+      tools,
+      handlers,
+      maxToolIterations = 5,
+      onToolCall,
+      onToolResult,
+      body,
+      ...syncParams
+    } = params;
+
+    let currentBody: unknown = withTools(body, tools);
+    let lastResponse: KitchenResponse | null = null;
+
+    for (let iteration = 0; iteration < maxToolIterations; iteration++) {
+      const response = await this.sync({
+        ...syncParams,
+        body: currentBody,
+      });
+      lastResponse = response;
+
+      const request = getToolCallRequest(response);
+      if (!request) {
+        return response;
+      }
+
+      const toolResults: LLMToolResult[] = [];
+      for (const toolCall of request.tool_calls) {
+        if (onToolCall) {
+          await onToolCall(toolCall);
+        }
+
+        const handler = handlers[toolCall.name];
+        let toolResult: LLMToolResult;
+        if (!handler) {
+          toolResult = createToolError({
+            toolCallId: toolCall.id,
+            name: toolCall.name,
+            message: `No handler registered for tool '${toolCall.name}'`,
+            code: "HANDLER_NOT_FOUND",
+          });
+        } else {
+          try {
+            const output = await handler(toolCall.arguments || {}, toolCall);
+            toolResult = createToolResult({
+              toolCallId: toolCall.id,
+              name: toolCall.name,
+              output,
+            });
+          } catch (error) {
+            toolResult = createToolError({
+              toolCallId: toolCall.id,
+              name: toolCall.name,
+              message: error instanceof Error ? error.message : String(error),
+              code: "HANDLER_ERROR",
+            });
+          }
+        }
+
+        if (onToolResult) {
+          await onToolResult(toolResult);
+        }
+        toolResults.push(toolResult);
+      }
+
+      currentBody = withToolResults(body, toolResults, request.continuation);
+    }
+
+    return {
+      ...(lastResponse || { status: "error" }),
+      status: "error",
+      error: `Maximum tool iterations reached (${maxToolIterations})`,
+    };
   }
 
   /**

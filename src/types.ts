@@ -16,6 +16,81 @@ export interface KitchenResponse {
   _statusCode?: number;
 }
 
+export type JSONSchema = Record<string, unknown>;
+
+export interface KitchenExternalTool {
+  type: "KitchenTool";
+  version: 1;
+  name: string;
+  description: string;
+  input_schema: JSONSchema;
+  executor: {
+    type: "external";
+  };
+}
+
+export interface KitchenEntryTool {
+  type: "KitchenTool";
+  version: 1;
+  name: string;
+  description: string;
+  input_schema: JSONSchema;
+  executor: {
+    type: "entry";
+    pipelineId: string;
+    entryBlockId: string;
+    output_mode?: "full_exit" | "selected_output" | "text";
+    selected_output?: string;
+  };
+}
+
+export type KitchenTool = KitchenExternalTool | KitchenEntryTool;
+
+export interface LLMToolCall {
+  type: "LLMToolCall";
+  version: 1;
+  id: string;
+  name: string;
+  arguments: Record<string, unknown>;
+  tool_type?: "external" | "entry" | string;
+  provider?: string;
+  raw?: unknown;
+}
+
+export interface LLMToolResult {
+  type: "LLMToolResult";
+  version: 1;
+  tool_call_id: string;
+  name: string;
+  status: "success" | "error";
+  output?: unknown;
+  error?: {
+    message: string;
+    code?: string;
+    details?: unknown;
+  };
+}
+
+export interface LLMContinuation {
+  type: "LLMContinuation";
+  version: 1;
+  provider: string;
+  model: string;
+  conversation: unknown[];
+  provider_state?: Record<string, unknown>;
+  tools?: KitchenTool[];
+  iteration?: number;
+}
+
+export interface ToolCallRequest {
+  status: "requires_tool_outputs";
+  tool_calls: LLMToolCall[];
+  continuation: LLMContinuation;
+  tool_results?: LLMToolResult[];
+  content?: string;
+  message?: unknown;
+}
+
 /**
  * Stream event types
  */
@@ -88,6 +163,21 @@ export interface SyncParams {
   apiKeyOverride?: OverrideAPIKey;
   /** Custom headers (optional, for HMAC signatures, etc.) */
   headers?: Record<string, string>;
+}
+
+export type ToolHandler = (
+  args: Record<string, unknown>,
+  toolCall: LLMToolCall,
+) => unknown | Promise<unknown>;
+
+export type ToolHandlerMap = Record<string, ToolHandler>;
+
+export interface RunWithToolsParams extends SyncParams {
+  tools: KitchenTool[];
+  handlers: ToolHandlerMap;
+  maxToolIterations?: number;
+  onToolCall?: (toolCall: LLMToolCall) => void | Promise<void>;
+  onToolResult?: (toolResult: LLMToolResult) => void | Promise<void>;
 }
 
 /**
