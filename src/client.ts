@@ -9,6 +9,10 @@ import type {
   OverrideAPIKey,
   RunWithToolsParams,
   LLMToolResult,
+  PipelineRunEventsResponse,
+  PipelineRunFinalPayloadRef,
+  PipelineRunStatus,
+  ResumableStreamParams,
 } from "./types";
 import {
   createToolError,
@@ -138,6 +142,24 @@ export class KitchenClient {
     return `https://${this.entryPoint}.entry.on.kitchen`;
   }
 
+  private getApiBaseUrl(): string {
+    if (!this.entryPoint || this.entryPoint === "entry") {
+      return "https://api.on.kitchen";
+    }
+
+    if (this.entryPoint.startsWith("http://") || this.entryPoint.startsWith("https://")) {
+      const url = new URL(this.entryPoint);
+      if (url.hostname === "entry.on.kitchen" || url.hostname === "entry.entry.on.kitchen") {
+        url.hostname = "api.on.kitchen";
+      } else if (url.hostname.endsWith(".entry.on.kitchen")) {
+        url.hostname = url.hostname.replace(".entry.on.kitchen", ".api.on.kitchen");
+      }
+      return url.toString().replace(/\/$/, "");
+    }
+
+    return `https://${this.entryPoint}.api.on.kitchen`;
+  }
+
   /**
    * Get standard headers for API requests
    */
@@ -244,6 +266,73 @@ export class KitchenClient {
       return JSON.parse(text);
     } catch {
       return text;
+    }
+  }
+
+  private async fetchJson<T>(url: string): Promise<T> {
+    const response = await fetch(url, {
+      method: "GET",
+      headers: this.getHeaders(),
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+    return await response.json() as T;
+  }
+
+  private parseSseFrame(frame: string): StreamEvent | null {
+    const dataLines: string[] = [];
+    for (const rawLine of frame.split(/\r?\n/)) {
+      const line = rawLine.trimEnd();
+      if (!line || line.startsWith(":")) continue;
+      if (line.startsWith("data:")) {
+        dataLines.push(line.slice(5).trimStart());
+      }
+    }
+    const data = dataLines.join("\n").trim();
+    if (!data) return null;
+    try {
+      return JSON.parse(data) as StreamEvent;
+    } catch {
+      return null;
+    }
+  }
+
+  private async *readSseResponse(response: Response): AsyncIterable<StreamEvent> {
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+    const reader = response.body?.getReader();
+    if (!reader) {
+      throw new Error("No response body");
+    }
+
+    const decoder = new TextDecoder();
+    let buffer = "";
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (value) {
+          buffer += decoder.decode(value, { stream: true });
+        }
+
+        let boundary = buffer.search(/\r?\n\r?\n/);
+        while (boundary >= 0) {
+          const frame = buffer.slice(0, boundary);
+          buffer = buffer.slice(buffer[boundary] === "\r" ? boundary + 4 : boundary + 2);
+          const event = this.parseSseFrame(frame);
+          if (event) yield event;
+          boundary = buffer.search(/\r?\n\r?\n/);
+        }
+
+        if (done) {
+          const event = this.parseSseFrame(buffer);
+          if (event) yield event;
+          break;
+        }
+      }
+    } finally {
+      reader.releaseLock();
     }
   }
 
@@ -365,6 +454,177 @@ export class KitchenClient {
       status: "error",
       error: `Maximum tool iterations reached (${maxToolIterations})`,
     };
+  }
+
+  async getPipelineRun(runId: string): Promise<PipelineRunStatus> {
+    const response = await this.fetchJson<{ pipelineRun: PipelineRunStatus }>(
+      `${this.getApiBaseUrl()}/pipelineruns/${runId}`,
+    );
+    return response.pipelineRun;
+  }
+
+  async getPipelineRunEvents(
+    runId: string,
+    options: { after?: number; limit?: number } = {},
+  ): Promise<PipelineRunEventsResponse> {
+    const params = new URLSearchParams();
+    if (options.after !== undefined) params.set("after", String(options.after));
+    if (options.limit !== undefined) params.set("limit", String(options.limit));
+    const query = params.toString();
+    return await this.fetchJson<PipelineRunEventsResponse>(
+      `${this.getApiBaseUrl()}/pipelineruns/${runId}/events${query ? `?${query}` : ""}`,
+    );
+  }
+
+  async fetchPipelineRunFinalPayload(ref: PipelineRunFinalPayloadRef): Promise<KitchenResponse> {
+    if (!ref?.url) {
+      throw new Error("Final payload reference does not include a URL");
+    }
+    const response = await fetch(ref.url);
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+    return await response.json() as KitchenResponse;
+  }
+
+  async *resumePipelineRunStream(
+    runId: string,
+    options: { after?: number } = {},
+  ): AsyncIterable<StreamEvent> {
+    const params = new URLSearchParams();
+    params.set("after", String(options.after || 0));
+    const response = await fetch(`${this.getBaseUrl()}/resumestream/${runId}?${params.toString()}`, {
+      method: "GET",
+      headers: this.getHeaders(),
+    });
+    yield* this.readSseResponse(response);
+  }
+
+  private isFinalPayloadRef(value: unknown): value is PipelineRunFinalPayloadRef {
+    return Boolean(
+      value &&
+        typeof value === "object" &&
+        "bucket" in value &&
+        "key" in value,
+    );
+  }
+
+  private async hydrateTerminalEvent(event: StreamEvent): Promise<StreamEvent> {
+    if (event.type !== "end" && event.type !== "error") {
+      return event;
+    }
+
+    const data = event.data;
+    if (!data || typeof data !== "object") {
+      return event;
+    }
+
+    const dataRecord = data as Record<string, unknown>;
+    const hasInlinePayload = "result" in dataRecord || "error" in dataRecord || "exitBlock" in dataRecord;
+    const ref = dataRecord.finalPayloadRef;
+    if (hasInlinePayload || !this.isFinalPayloadRef(ref)) {
+      return event;
+    }
+
+    return {
+      ...event,
+      data: await this.fetchPipelineRunFinalPayload(ref),
+    };
+  }
+
+  /**
+   * Execute or resume a streamed recipe run.
+   *
+   * If runId is provided, the stream starts by replaying events after afterSeq and
+   * then follows live Mongo change-stream events. If runId is omitted, this starts
+   * a normal stream and records the runId/seq callbacks once the runner emits them.
+   */
+  async *streamResumable(params: ResumableStreamParams): AsyncIterable<StreamEvent> {
+    const {
+      runId: initialRunId,
+      afterSeq = 0,
+      onRunId,
+      onSeq,
+      maxReconnects = 3,
+      ...streamParams
+    } = params;
+
+    let runId = initialRunId;
+    let lastSeq = afterSeq;
+    let reconnects = 0;
+    let source: AsyncIterable<StreamEvent> = runId
+      ? this.resumePipelineRunStream(runId, { after: lastSeq })
+      : this.stream(streamParams);
+
+    const remember = (event: StreamEvent) => {
+      if (event.runId && event.runId !== runId) {
+        runId = event.runId;
+        onRunId?.(runId);
+      }
+
+      if (typeof event.seq === "number" && event.seq > lastSeq) {
+        lastSeq = event.seq;
+        onSeq?.(lastSeq, event);
+      }
+    };
+
+    while (true) {
+      try {
+        for await (const rawEvent of source) {
+          const event = await this.hydrateTerminalEvent(rawEvent);
+          remember(event);
+          yield event;
+
+          if (event.type === "end" || event.type === "error") {
+            return;
+          }
+        }
+        return;
+      } catch (error) {
+        if (!runId || reconnects >= maxReconnects) {
+          throw error;
+        }
+
+        reconnects += 1;
+        const eventSnapshot = await this.getPipelineRunEvents(runId, { after: lastSeq });
+        for (const rawEvent of eventSnapshot.events) {
+          const event = await this.hydrateTerminalEvent(rawEvent);
+          remember(event);
+          yield event;
+
+          if (event.type === "end" || event.type === "error") {
+            return;
+          }
+        }
+
+        const status = await this.getPipelineRun(runId);
+        if (status.status !== "running") {
+          const terminalType = status.status === "finished" ? "end" : "error";
+          const finalPayload = status.finalPayloadRef
+            ? await this.fetchPipelineRunFinalPayload(status.finalPayloadRef)
+            : status;
+          const finalSeq =
+            typeof status.stream?.finalSeq === "number"
+              ? status.stream.finalSeq
+              : lastSeq;
+
+          const terminalEvent: StreamEvent = {
+            runId,
+            seq: finalSeq,
+            type: terminalType,
+            time: Date.now(),
+            data: finalPayload,
+            statusCode: terminalType === "end" ? 200 : 500,
+          };
+
+          remember(terminalEvent);
+          yield terminalEvent;
+          return;
+        }
+
+        source = this.resumePipelineRunStream(runId, { after: lastSeq });
+      }
+    }
   }
 
   /**

@@ -94,7 +94,7 @@ export interface ToolCallRequest {
 /**
  * Stream event types
  */
-export type StreamEventType = "progress" | "result" | "delta" | "info" | "end";
+export type StreamEventType = "start" | "progress" | "result" | "delta" | "info" | "debug" | "mock" | "end" | "error";
 
 /**
  * Progress event data
@@ -113,6 +113,8 @@ export interface StreamEvent {
   runId: string;
   /** Event type */
   type: StreamEventType;
+  /** Durable stream sequence for resumable streams */
+  seq?: number;
   /** Timestamp */
   time: number;
   /** Event-specific data */
@@ -198,6 +200,51 @@ export interface StreamParams {
   apiKeyOverride?: OverrideAPIKey;
   /** Custom headers (optional, for HMAC signatures, etc.) */
   headers?: Record<string, string>;
+}
+
+export interface PipelineRunFinalPayloadRef {
+  bucket: string;
+  key: string;
+  url?: string;
+  contentType?: string;
+  bytes?: number;
+  writtenAt?: number;
+}
+
+export interface PipelineRunStatus {
+  runId: string;
+  pipelineId?: string;
+  entryId?: string;
+  status: string;
+  currentBlock?: string | null;
+  blocks?: unknown[];
+  startTime?: number;
+  endTime?: number | null;
+  billableTime?: number | null;
+  error?: unknown;
+  stream?: {
+    enabled?: boolean;
+    eventsAvailable?: boolean;
+    finalSeq?: number | null;
+    eventsDeletedAt?: number | null;
+  } | null;
+  finalPayloadRef?: PipelineRunFinalPayloadRef | null;
+}
+
+export interface PipelineRunEventsResponse {
+  runId: string;
+  events: StreamEvent[];
+  status: string;
+  finalPayloadRef?: PipelineRunFinalPayloadRef | null;
+  eventsAvailable?: boolean;
+}
+
+export interface ResumableStreamParams extends StreamParams {
+  runId?: string;
+  afterSeq?: number;
+  onRunId?: (runId: string) => void;
+  onSeq?: (seq: number, event: StreamEvent) => void;
+  maxReconnects?: number;
 }
 
 /**

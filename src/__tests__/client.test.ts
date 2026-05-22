@@ -422,7 +422,7 @@ describe("KitchenClient", () => {
       });
 
       await expect(
-        async () => {
+        (async () => {
           const events = [];
           for await (const event of client.stream({
             recipeId: "test-recipe",
@@ -431,13 +431,13 @@ describe("KitchenClient", () => {
           })) {
             events.push(event);
           }
-        },
+        })(),
       ).rejects.toThrow("HTTP error! status: 500");
     });
   });
 
   describe("URL construction", () => {
-    it("should construct correct URL for entry point 'entry'", () => {
+    it("should construct correct URL for entry point 'entry'", async () => {
       client = new KitchenClient({ authCode: "test-code", entryPoint: "entry" });
 
       mockFetch.mockResolvedValue({
@@ -448,7 +448,7 @@ describe("KitchenClient", () => {
         text: async () => '{"status":"finished"}',
       });
 
-      client.sync({
+      await client.sync({
         recipeId: "abc123",
         entryId: "def456",
         body: {},
@@ -460,7 +460,7 @@ describe("KitchenClient", () => {
       );
     });
 
-    it("should construct correct URL for custom entry point", () => {
+    it("should construct correct URL for custom entry point", async () => {
       client = new KitchenClient({ authCode: "test-code", entryPoint: "beta" });
 
       mockFetch.mockResolvedValue({
@@ -471,7 +471,7 @@ describe("KitchenClient", () => {
         text: async () => '{"status":"finished"}',
       });
 
-      client.sync({
+      await client.sync({
         recipeId: "abc123",
         entryId: "def456",
         body: {},
