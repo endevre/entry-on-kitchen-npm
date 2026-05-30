@@ -8,17 +8,29 @@ import {
   withToolResults,
   withTools,
 } from "../tools";
-import type { DeltaOperation } from "../types";
+import type { DeltaOperation, StreamEvent } from "../types";
 
 // Mock fetch globally
 const mockFetch = vi.fn();
 global.fetch = mockFetch;
 
+function sseStream(events: unknown[]): ReadableStream<Uint8Array> {
+  const payload = events
+    .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+    .join("");
+  return new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(payload));
+      controller.close();
+    },
+  });
+}
+
 describe("KitchenClient", () => {
   let client: KitchenClient;
 
   beforeEach(() => {
-    vi.clearAllMocks();
+    mockFetch.mockReset();
   });
 
   describe("constructor", () => {
@@ -152,6 +164,42 @@ describe("KitchenClient", () => {
             KITCHEN_MODELS_OVERRIDE: {
               models__llm_override: "openai/gpt-5.4",
             },
+          }),
+        }),
+      );
+    });
+
+    it("should pass agent metadata as tracing headers", async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        headers: new Headers(),
+        text: async () => JSON.stringify({ status: "finished" }),
+      });
+
+      await client.sync({
+        recipeId: "test-recipe",
+        entryId: "test-entry",
+        body: { message: "Hello!" },
+        agentMetadata: {
+          agentId: "agent-1",
+          agentSessionId: "session-1",
+          agentRunId: "run-1",
+          workspaceId: "workspace-1",
+          idempotencyKey: "idem-1",
+        },
+      });
+
+      expect(mockFetch).toHaveBeenCalledWith(
+        "https://raydev.entry.on.kitchen/test-recipe/test-entry/sync",
+        expect.objectContaining({
+          headers: expect.objectContaining({
+            "X-Kitchen-Agent-Id": "agent-1",
+            "X-Kitchen-Agent-Session-Id": "session-1",
+            "X-Kitchen-Agent-Run-Id": "run-1",
+            "X-Kitchen-Workspace-Id": "workspace-1",
+            "X-Kitchen-Idempotency-Key": "idem-1",
           }),
         }),
       );
@@ -414,6 +462,92 @@ describe("KitchenClient", () => {
       expect(events[1]).toMatchObject({ type: "end" });
     });
 
+    it("should decode stringified SSE events from stream", async () => {
+      const stringifiedEvent = JSON.stringify({
+        runId: null,
+        type: "end",
+        time: 123456,
+        data: JSON.stringify({
+          runId: null,
+          status: "error",
+          error: "bad request, user does not have permission to execute pipeline",
+        }),
+        socket: null,
+        statusCode: 400,
+      });
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        body: sseStream([stringifiedEvent]),
+      });
+
+      const events: StreamEvent[] = [];
+      for await (const event of client.stream({
+        recipeId: "test-recipe",
+        entryId: "test-entry",
+        body: { message: "Hello!" },
+      })) {
+        events.push(event);
+      }
+
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({
+        type: "end",
+        statusCode: 400,
+      });
+      expect(events[0].data).toEqual({
+        runId: null,
+        status: "error",
+        error: "bad request, user does not have permission to execute pipeline",
+      });
+    });
+
+    it("should hydrate terminal events from final payload refs in normal stream", async () => {
+      mockFetch
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          body: sseStream([
+            {
+              runId: "run-4",
+              seq: 1,
+              type: "end",
+              time: 1,
+              data: {
+                runId: "run-4",
+                status: "finished",
+                finalPayloadRef: { url: "https://signed.example/final-normal-stream.json" },
+                error: null,
+              },
+              statusCode: 200,
+            },
+          ]),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ runId: "run-4", status: "finished", result: "{\"ok\":true}" }),
+        });
+
+      const events: StreamEvent[] = [];
+      for await (const event of client.stream({
+        recipeId: "test-recipe",
+        entryId: "test-entry",
+        body: { message: "Hello!" },
+      })) {
+        events.push(event);
+      }
+
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({
+        runId: "run-4",
+        seq: 1,
+        type: "end",
+        data: { runId: "run-4", status: "finished", result: "{\"ok\":true}" },
+      });
+      expect(mockFetch).toHaveBeenCalledWith("https://signed.example/final-normal-stream.json");
+    });
+
     it("should throw on HTTP error", async () => {
       mockFetch.mockResolvedValueOnce({
         ok: false,
@@ -433,6 +567,169 @@ describe("KitchenClient", () => {
           }
         })(),
       ).rejects.toThrow("HTTP error! status: 500");
+    });
+
+    it("should reconnect a resumable stream after a clean close before terminal event", async () => {
+      mockFetch
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          body: sseStream([
+            {
+              runId: "run-1",
+              seq: 1,
+              type: "progress",
+              time: 1,
+              data: { message: "started" },
+              statusCode: 200,
+            },
+          ]),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ runId: "run-1", events: [], status: "running" }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ pipelineRun: { runId: "run-1", status: "running" } }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          body: sseStream([
+            {
+              runId: "run-1",
+              seq: 2,
+              type: "end",
+              time: 2,
+              data: { status: "finished" },
+              statusCode: 200,
+            },
+          ]),
+        });
+
+      const events = [];
+      for await (const event of client.streamResumable({
+        recipeId: "test-recipe",
+        entryId: "test-entry",
+        body: { message: "Hello!" },
+        maxReconnects: 1,
+        reconnectDelayMs: 0,
+      })) {
+        events.push(event);
+      }
+
+      expect(events.map((event) => event.type)).toEqual(["progress", "end"]);
+      expect(mockFetch).toHaveBeenCalledWith(
+        "https://raydev.entry.on.kitchen/resumestream/run-1?after=1",
+        expect.objectContaining({ method: "GET" }),
+      );
+    });
+
+    it("should synthesize a terminal event from run status when stream events were already cleaned up", async () => {
+      mockFetch
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          body: sseStream([
+            {
+              runId: "run-2",
+              seq: 3,
+              type: "progress",
+              time: 1,
+              data: { message: "almost done" },
+              statusCode: 200,
+            },
+          ]),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            runId: "run-2",
+            events: [],
+            status: "finished",
+            finalPayloadRef: { bucket: "b", key: "k", url: "https://signed.example/final.json" },
+          }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            pipelineRun: {
+              runId: "run-2",
+              status: "finished",
+              stream: { finalSeq: 4, eventsAvailable: false },
+              finalPayloadRef: { bucket: "b", key: "k", url: "https://signed.example/final.json" },
+            },
+          }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ runId: "run-2", status: "finished", result: "{\"ok\":true}" }),
+        });
+
+      const events = [];
+      for await (const event of client.streamResumable({
+        recipeId: "test-recipe",
+        entryId: "test-entry",
+        body: { message: "Hello!" },
+        maxReconnects: 1,
+        reconnectDelayMs: 0,
+      })) {
+        events.push(event);
+      }
+
+      expect(events).toHaveLength(2);
+      expect(events[1]).toMatchObject({
+        runId: "run-2",
+        seq: 4,
+        type: "end",
+        data: { runId: "run-2", status: "finished", result: "{\"ok\":true}" },
+      });
+    });
+
+    it("should hydrate terminal stream events from URL-only final payload refs", async () => {
+      mockFetch
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          body: sseStream([
+            {
+              runId: "run-3",
+              seq: 1,
+              type: "end",
+              time: 1,
+              data: {
+                runId: "run-3",
+                status: "finished",
+                finalPayloadRef: { url: "https://signed.example/final-url-only.json" },
+                error: null,
+              },
+              statusCode: 200,
+            },
+          ]),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ runId: "run-3", status: "finished", result: "{\"ok\":true}" }),
+        });
+
+      const events = [];
+      for await (const event of client.streamResumable({
+        recipeId: "test-recipe",
+        entryId: "test-entry",
+        body: { message: "Hello!" },
+      })) {
+        events.push(event);
+      }
+
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({
+        runId: "run-3",
+        seq: 1,
+        type: "end",
+        data: { runId: "run-3", status: "finished", result: "{\"ok\":true}" },
+      });
+      expect(mockFetch).toHaveBeenCalledWith("https://signed.example/final-url-only.json");
     });
   });
 

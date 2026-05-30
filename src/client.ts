@@ -13,6 +13,7 @@ import type {
   PipelineRunFinalPayloadRef,
   PipelineRunStatus,
   ResumableStreamParams,
+  AgentRunMetadata,
 } from "./types";
 import {
   createToolError,
@@ -182,6 +183,46 @@ export class KitchenClient {
     return headers;
   }
 
+  private getAgentMetadataHeaders(agentMetadata?: AgentRunMetadata): HeadersObject {
+    if (!agentMetadata) return {};
+
+    const headers: HeadersObject = {};
+    const mappings: Array<[keyof AgentRunMetadata, string]> = [
+      ["agentId", "X-Kitchen-Agent-Id"],
+      ["agentSessionId", "X-Kitchen-Agent-Session-Id"],
+      ["agentRunId", "X-Kitchen-Agent-Run-Id"],
+      ["parentRunId", "X-Kitchen-Parent-Run-Id"],
+      ["parentToolCallId", "X-Kitchen-Parent-Tool-Call-Id"],
+      ["workspaceId", "X-Kitchen-Workspace-Id"],
+      ["workspaceVersionId", "X-Kitchen-Workspace-Version-Id"],
+      ["idempotencyKey", "X-Kitchen-Idempotency-Key"],
+    ];
+
+    for (const [key, header] of mappings) {
+      const value = agentMetadata[key];
+      if (value !== undefined && value !== null && value !== "") {
+        headers[header] = String(value);
+      }
+    }
+
+    return headers;
+  }
+
+  private mergeHeaders(
+    customHeaders?: Record<string, string>,
+    agentMetadata?: AgentRunMetadata,
+  ): HeadersObject | undefined {
+    const metadataHeaders = this.getAgentMetadataHeaders(agentMetadata);
+    if (!customHeaders && Object.keys(metadataHeaders).length === 0) {
+      return undefined;
+    }
+
+    return {
+      ...metadataHeaders,
+      ...(customHeaders || {}),
+    };
+  }
+
   /**
    * Prepare the request body
    */
@@ -292,7 +333,23 @@ export class KitchenClient {
     const data = dataLines.join("\n").trim();
     if (!data) return null;
     try {
-      return JSON.parse(data) as StreamEvent;
+      const parsed = JSON.parse(data) as unknown;
+      if (typeof parsed === "string") {
+        return JSON.parse(parsed) as StreamEvent;
+      }
+      return parsed as StreamEvent;
+    } catch {
+      return null;
+    }
+  }
+
+  private parseStreamEvent(value: string): StreamEvent | null {
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      if (typeof parsed === "string") {
+        return JSON.parse(parsed) as StreamEvent;
+      }
+      return parsed as StreamEvent;
     } catch {
       return null;
     }
@@ -358,11 +415,11 @@ export class KitchenClient {
    * ```
    */
   async sync(params: SyncParams): Promise<KitchenResponse> {
-    const { recipeId, entryId, body, useKitchenBilling, llmOverride, apiKeyOverride, headers } = params;
+    const { recipeId, entryId, body, useKitchenBilling, llmOverride, apiKeyOverride, headers, agentMetadata } = params;
     const url = `${this.getBaseUrl()}/${recipeId}/${entryId}/sync`;
     const stringifiedBody = this.prepareBody(body, useKitchenBilling, llmOverride, apiKeyOverride);
 
-    const response = await this.httpRequest(url, stringifiedBody, headers);
+    const response = await this.httpRequest(url, stringifiedBody, this.mergeHeaders(headers, agentMetadata));
 
     // If we got an error response, return it with status code
     if (response.status !== 200) {
@@ -504,8 +561,10 @@ export class KitchenClient {
     return Boolean(
       value &&
         typeof value === "object" &&
-        "bucket" in value &&
-        "key" in value,
+        (
+          ("bucket" in value && "key" in value) ||
+          "url" in value
+        ),
     );
   }
 
@@ -514,22 +573,68 @@ export class KitchenClient {
       return event;
     }
 
-    const data = event.data;
+    const data =
+      typeof event.data === "string"
+        ? this.parseStreamEvent(event.data) || event.data
+        : event.data;
     if (!data || typeof data !== "object") {
-      return event;
+      return data === event.data ? event : { ...event, data };
     }
 
     const dataRecord = data as Record<string, unknown>;
-    const hasInlinePayload = "result" in dataRecord || "error" in dataRecord || "exitBlock" in dataRecord;
+    const hasInlineError =
+      dataRecord.error !== undefined &&
+      dataRecord.error !== null &&
+      dataRecord.error !== "" &&
+      dataRecord.error !== "null";
+    const hasInlinePayload = "result" in dataRecord || hasInlineError || "exitBlock" in dataRecord;
     const ref = dataRecord.finalPayloadRef;
     if (hasInlinePayload || !this.isFinalPayloadRef(ref)) {
-      return event;
+      return data === event.data ? event : { ...event, data };
     }
 
     return {
       ...event,
       data: await this.fetchPipelineRunFinalPayload(ref),
     };
+  }
+
+  private isPipelineRunActive(status: string | undefined | null): boolean {
+    if (!status) return true;
+    return ["queued", "pending", "starting", "running", "in_progress"].includes(
+      status.toLowerCase(),
+    );
+  }
+
+  private isTerminalStreamEvent(event: StreamEvent): boolean {
+    return event.type === "end" || event.type === "error";
+  }
+
+  private buildTerminalEventFromRunStatus(
+    runId: string,
+    status: PipelineRunStatus,
+    data: unknown,
+    lastSeq: number,
+  ): StreamEvent {
+    const terminalType = status.status === "finished" ? "end" : "error";
+    const finalSeq =
+      typeof status.stream?.finalSeq === "number"
+        ? status.stream.finalSeq
+        : lastSeq + 1;
+
+    return {
+      runId,
+      seq: finalSeq,
+      type: terminalType,
+      time: Date.now(),
+      data,
+      statusCode: terminalType === "end" ? 200 : 500,
+    };
+  }
+
+  private async waitForReconnect(delayMs: number): Promise<void> {
+    if (delayMs <= 0) return;
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
   }
 
   /**
@@ -546,6 +651,7 @@ export class KitchenClient {
       onRunId,
       onSeq,
       maxReconnects = 3,
+      reconnectDelayMs = 250,
       ...streamParams
     } = params;
 
@@ -568,60 +674,88 @@ export class KitchenClient {
       }
     };
 
+    const yieldMissedEventsAndMaybeTerminal = async function* (
+      self: KitchenClient,
+      activeRunId: string,
+    ): AsyncIterable<{ event: StreamEvent; terminal: boolean }> {
+      const eventSnapshot = await self.getPipelineRunEvents(activeRunId, { after: lastSeq });
+      for (const rawEvent of eventSnapshot.events || []) {
+        const event = await self.hydrateTerminalEvent(rawEvent);
+        remember(event);
+        yield { event, terminal: self.isTerminalStreamEvent(event) };
+
+        if (self.isTerminalStreamEvent(event)) {
+          return;
+        }
+      }
+
+      const status = await self.getPipelineRun(activeRunId);
+      if (self.isPipelineRunActive(status.status)) {
+        return;
+      }
+
+      const finalPayload = status.finalPayloadRef
+        ? await self.fetchPipelineRunFinalPayload(status.finalPayloadRef)
+        : status;
+      const terminalEvent = self.buildTerminalEventFromRunStatus(
+        activeRunId,
+        status,
+        finalPayload,
+        lastSeq,
+      );
+
+      remember(terminalEvent);
+      yield { event: terminalEvent, terminal: true };
+    };
+
     while (true) {
       try {
+        let sawTerminal = false;
         for await (const rawEvent of source) {
           const event = await this.hydrateTerminalEvent(rawEvent);
           remember(event);
           yield event;
 
-          if (event.type === "end" || event.type === "error") {
+          if (this.isTerminalStreamEvent(event)) {
+            sawTerminal = true;
             return;
           }
         }
-        return;
+
+        if (sawTerminal) {
+          return;
+        }
+
+        if (!runId) {
+          throw new Error("Resumable stream closed before terminal event and before a runId was emitted");
+        }
+
+        if (reconnects >= maxReconnects) {
+          throw new Error(
+            `Resumable stream closed before terminal event after ${maxReconnects} reconnect attempts for run ${runId}`,
+          );
+        }
+
+        reconnects += 1;
+        for await (const { event, terminal } of yieldMissedEventsAndMaybeTerminal(this, runId)) {
+          yield event;
+          if (terminal) return;
+        }
+
+        await this.waitForReconnect(reconnectDelayMs);
+        source = this.resumePipelineRunStream(runId, { after: lastSeq });
       } catch (error) {
         if (!runId || reconnects >= maxReconnects) {
           throw error;
         }
 
         reconnects += 1;
-        const eventSnapshot = await this.getPipelineRunEvents(runId, { after: lastSeq });
-        for (const rawEvent of eventSnapshot.events) {
-          const event = await this.hydrateTerminalEvent(rawEvent);
-          remember(event);
+        for await (const { event, terminal } of yieldMissedEventsAndMaybeTerminal(this, runId)) {
           yield event;
-
-          if (event.type === "end" || event.type === "error") {
-            return;
-          }
+          if (terminal) return;
         }
 
-        const status = await this.getPipelineRun(runId);
-        if (status.status !== "running") {
-          const terminalType = status.status === "finished" ? "end" : "error";
-          const finalPayload = status.finalPayloadRef
-            ? await this.fetchPipelineRunFinalPayload(status.finalPayloadRef)
-            : status;
-          const finalSeq =
-            typeof status.stream?.finalSeq === "number"
-              ? status.stream.finalSeq
-              : lastSeq;
-
-          const terminalEvent: StreamEvent = {
-            runId,
-            seq: finalSeq,
-            type: terminalType,
-            time: Date.now(),
-            data: finalPayload,
-            statusCode: terminalType === "end" ? 200 : 500,
-          };
-
-          remember(terminalEvent);
-          yield terminalEvent;
-          return;
-        }
-
+        await this.waitForReconnect(reconnectDelayMs);
         source = this.resumePipelineRunStream(runId, { after: lastSeq });
       }
     }
@@ -653,13 +787,13 @@ export class KitchenClient {
    * ```
    */
   async *stream(params: StreamParams): AsyncIterable<StreamEvent> {
-    const { recipeId, entryId, body, useKitchenBilling, llmOverride, apiKeyOverride, headers } = params;
+    const { recipeId, entryId, body, useKitchenBilling, llmOverride, apiKeyOverride, headers, agentMetadata } = params;
     const url = `${this.getBaseUrl()}/${recipeId}/${entryId}/stream`;
     const stringifiedBody = this.prepareBody(body, useKitchenBilling, llmOverride, apiKeyOverride);
 
     const response = await fetch(url, {
       method: "POST",
-      headers: this.getHeaders(headers),
+      headers: this.getHeaders(this.mergeHeaders(headers, agentMetadata)),
       body: stringifiedBody,
     });
 
@@ -743,19 +877,15 @@ export class KitchenClient {
                 continue;
               }
 
-              try {
-                const obj = JSON.parse(trimmedLine);
-                yield obj as StreamEvent;
-              } catch {
+              const obj = this.parseStreamEvent(trimmedLine);
+              if (obj) {
+                yield await this.hydrateTerminalEvent(obj);
+              } else {
                 // Try concatenated format
                 const objects = extractCompleteJsonObjects(trimmedLine);
                 for (const objStr of objects) {
-                  try {
-                    const obj = JSON.parse(objStr);
-                    yield obj as StreamEvent;
-                  } catch {
-                    // Skip invalid JSON
-                  }
+                  const parsedObject = this.parseStreamEvent(objStr);
+                  if (parsedObject) yield await this.hydrateTerminalEvent(parsedObject);
                 }
               }
             }
@@ -783,19 +913,15 @@ export class KitchenClient {
           for (let i = 0; i < linesToProcess; i++) {
             const line = lines[i].trim();
             if (line) {
-              try {
-                const obj = JSON.parse(line);
-                yield obj as StreamEvent;
-              } catch {
+              const obj = this.parseStreamEvent(line);
+              if (obj) {
+                yield await this.hydrateTerminalEvent(obj);
+              } else {
                 // Try concatenated format
                 const objects = extractCompleteJsonObjects(line);
                 for (const objStr of objects) {
-                  try {
-                    const obj = JSON.parse(objStr);
-                    yield obj as StreamEvent;
-                  } catch {
-                    // Skip invalid JSON
-                  }
+                  const parsedObject = this.parseStreamEvent(objStr);
+                  if (parsedObject) yield await this.hydrateTerminalEvent(parsedObject);
                 }
               }
             }
@@ -814,11 +940,11 @@ export class KitchenClient {
           let lastEndIdx = 0;
 
           for (const objStr of objects) {
-            try {
-              const obj = JSON.parse(objStr);
-              yield obj as StreamEvent;
+            const obj = this.parseStreamEvent(objStr);
+            if (obj) {
+              yield await this.hydrateTerminalEvent(obj);
               lastEndIdx += objStr.length;
-            } catch {
+            } else {
               // Skip invalid JSON
             }
           }

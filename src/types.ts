@@ -148,6 +148,20 @@ export type OverrideAPIKey = {
 };
 
 /**
+ * Optional metadata used to relate Kitchen runs to a higher-level agent/session.
+ */
+export interface AgentRunMetadata {
+  agentId?: string;
+  agentSessionId?: string;
+  agentRunId?: string;
+  parentRunId?: string;
+  parentToolCallId?: string;
+  workspaceId?: string;
+  workspaceVersionId?: string;
+  idempotencyKey?: string;
+}
+
+/**
  * Parameters for sync execution
  */
 export interface SyncParams {
@@ -165,6 +179,8 @@ export interface SyncParams {
   apiKeyOverride?: OverrideAPIKey;
   /** Custom headers (optional, for HMAC signatures, etc.) */
   headers?: Record<string, string>;
+  /** Optional parent agent/session metadata for durable run tracing */
+  agentMetadata?: AgentRunMetadata;
 }
 
 export type ToolHandler = (
@@ -200,6 +216,8 @@ export interface StreamParams {
   apiKeyOverride?: OverrideAPIKey;
   /** Custom headers (optional, for HMAC signatures, etc.) */
   headers?: Record<string, string>;
+  /** Optional parent agent/session metadata for durable run tracing */
+  agentMetadata?: AgentRunMetadata;
 }
 
 export interface PipelineRunFinalPayloadRef {
@@ -245,6 +263,7 @@ export interface ResumableStreamParams extends StreamParams {
   onRunId?: (runId: string) => void;
   onSeq?: (seq: number, event: StreamEvent) => void;
   maxReconnects?: number;
+  reconnectDelayMs?: number;
 }
 
 /**
