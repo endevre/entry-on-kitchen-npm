@@ -1,6 +1,6 @@
 {
   "name": "@endevre/entry-on-kitchen",
-  "version": "0.3.8",
+  "version": "0.3.9",
   "description": "Official JavaScript/TypeScript library for Entry on Kitchen API",
   "repository": "endevre/entry-on-kitchen-npm",
   "license": "ISC",

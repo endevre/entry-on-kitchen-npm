@@ -14,6 +14,7 @@ import type {
   PipelineRunStatus,
   ResumableStreamParams,
   AgentRunMetadata,
+  ThinkingLevel,
 } from "./types";
 import {
   createToolError,
@@ -24,6 +25,22 @@ import {
 } from "./tools";
 
 type HeadersObject = Record<string, string>;
+
+const THINKING_LEVELS = new Set<ThinkingLevel>(["off", "low", "medium", "high", "xhigh", "max"]);
+
+function normalizeThinkingOverride(value: ThinkingLevel | undefined): ThinkingLevel | undefined {
+  if (value === undefined || value === null || String(value).trim() === "") {
+    return undefined;
+  }
+
+  const normalized = String(value).trim().toLowerCase() as ThinkingLevel;
+  if (!THINKING_LEVELS.has(normalized)) {
+    throw new Error(
+      "Invalid thinkingOverride. Expected one of: off, low, medium, high, xhigh, max",
+    );
+  }
+  return normalized;
+}
 
 /**
  * Apply delta operations to a string
@@ -230,7 +247,8 @@ export class KitchenClient {
     body: unknown,
     useKitchenBilling?: boolean,
     llmOverride?: string,
-    apiKeyOverride?: OverrideAPIKey
+    apiKeyOverride?: OverrideAPIKey,
+    thinkingOverride?: ThinkingLevel,
   ): string {
     let bodyObj = typeof body === "string" ? JSON.parse(body) : body;
 
@@ -258,6 +276,15 @@ export class KitchenClient {
           ...existingModelOverrides,
           models__llm_override: llmOverride,
         },
+      };
+    }
+
+    // Add KITCHEN_THINKING_OVERRIDE if thinkingOverride is specified
+    const normalizedThinking = normalizeThinkingOverride(thinkingOverride);
+    if (normalizedThinking) {
+      bodyObj = {
+        ...((bodyObj as Record<string, unknown>) || {}),
+        KITCHEN_THINKING_OVERRIDE: normalizedThinking,
       };
     }
 
@@ -415,9 +442,25 @@ export class KitchenClient {
    * ```
    */
   async sync(params: SyncParams): Promise<KitchenResponse> {
-    const { recipeId, entryId, body, useKitchenBilling, llmOverride, apiKeyOverride, headers, agentMetadata } = params;
+    const {
+      recipeId,
+      entryId,
+      body,
+      useKitchenBilling,
+      llmOverride,
+      thinkingOverride,
+      apiKeyOverride,
+      headers,
+      agentMetadata,
+    } = params;
     const url = `${this.getBaseUrl()}/${recipeId}/${entryId}/sync`;
-    const stringifiedBody = this.prepareBody(body, useKitchenBilling, llmOverride, apiKeyOverride);
+    const stringifiedBody = this.prepareBody(
+      body,
+      useKitchenBilling,
+      llmOverride,
+      apiKeyOverride,
+      thinkingOverride,
+    );
 
     const response = await this.httpRequest(url, stringifiedBody, this.mergeHeaders(headers, agentMetadata));
 
@@ -787,9 +830,25 @@ export class KitchenClient {
    * ```
    */
   async *stream(params: StreamParams): AsyncIterable<StreamEvent> {
-    const { recipeId, entryId, body, useKitchenBilling, llmOverride, apiKeyOverride, headers, agentMetadata } = params;
+    const {
+      recipeId,
+      entryId,
+      body,
+      useKitchenBilling,
+      llmOverride,
+      thinkingOverride,
+      apiKeyOverride,
+      headers,
+      agentMetadata,
+    } = params;
     const url = `${this.getBaseUrl()}/${recipeId}/${entryId}/stream`;
-    const stringifiedBody = this.prepareBody(body, useKitchenBilling, llmOverride, apiKeyOverride);
+    const stringifiedBody = this.prepareBody(
+      body,
+      useKitchenBilling,
+      llmOverride,
+      apiKeyOverride,
+      thinkingOverride,
+    );
 
     const response = await fetch(url, {
       method: "POST",

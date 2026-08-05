@@ -169,6 +169,49 @@ describe("KitchenClient", () => {
       );
     });
 
+    it("should serialize thinkingOverride using KITCHEN_THINKING_OVERRIDE", async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        headers: new Headers(),
+        text: async () => JSON.stringify({ status: "finished" }),
+      });
+
+      await client.sync({
+        recipeId: "test-recipe",
+        entryId: "test-entry",
+        body: { message: "Hello!" },
+        llmOverride: "openai/gpt-5.4",
+        thinkingOverride: "high",
+      });
+
+      expect(mockFetch).toHaveBeenCalledWith(
+        "https://raydev.entry.on.kitchen/test-recipe/test-entry/sync",
+        expect.objectContaining({
+          body: JSON.stringify({
+            message: "Hello!",
+            KITCHEN_MODELS_OVERRIDE: {
+              models__llm_override: "openai/gpt-5.4",
+            },
+            KITCHEN_THINKING_OVERRIDE: "high",
+          }),
+        }),
+      );
+    });
+
+    it("should reject unsupported thinkingOverride values at the client boundary", async () => {
+      await expect(
+        client.sync({
+          recipeId: "test-recipe",
+          entryId: "test-entry",
+          body: { message: "Hello!" },
+          thinkingOverride: "auto" as never,
+        }),
+      ).rejects.toThrow("Invalid thinkingOverride");
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
     it("should pass agent metadata as tracing headers", async () => {
       mockFetch.mockResolvedValueOnce({
         ok: true,
@@ -334,6 +377,7 @@ describe("KitchenClient", () => {
         handlers: {
           lookup: async (args) => ({ found: args.id }),
         },
+        thinkingOverride: "high",
       });
 
       expect(result.result).toEqual({ answer: "done" });
@@ -343,6 +387,7 @@ describe("KitchenClient", () => {
         name: "lookup",
         status: "success",
       });
+      expect(secondBody.KITCHEN_THINKING_OVERRIDE).toBe("high");
     });
   });
 

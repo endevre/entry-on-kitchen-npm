@@ -33,6 +33,7 @@ export type {
   SyncParams,
   StreamParams,
   ResumableStreamParams,
+  ThinkingLevel,
   StreamEvent,
   StreamEventType,
   PipelineRunEventsResponse,

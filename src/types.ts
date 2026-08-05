@@ -147,6 +147,9 @@ export type OverrideAPIKey = {
   };
 };
 
+/** Standardized Kitchen runtime thinking levels. */
+export type ThinkingLevel = "off" | "low" | "medium" | "high" | "xhigh" | "max";
+
 /**
  * Optional metadata used to relate Kitchen runs to a higher-level agent/session.
  */
@@ -175,6 +178,8 @@ export interface SyncParams {
   useKitchenBilling?: boolean;
   /** LLM model override (optional) */
   llmOverride?: string;
+  /** Standardized runtime thinking level (optional) */
+  thinkingOverride?: ThinkingLevel;
   /** API key overrides (optional) */
   apiKeyOverride?: OverrideAPIKey;
   /** Custom headers (optional, for HMAC signatures, etc.) */
@@ -212,6 +217,8 @@ export interface StreamParams {
   useKitchenBilling?: boolean;
   /** LLM model override (optional) */
   llmOverride?: string;
+  /** Standardized runtime thinking level (optional) */
+  thinkingOverride?: ThinkingLevel;
   /** API key overrides (optional) */
   apiKeyOverride?: OverrideAPIKey;
   /** Custom headers (optional, for HMAC signatures, etc.) */

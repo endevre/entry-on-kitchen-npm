@@ -66,6 +66,7 @@ Execute a recipe synchronously and wait for the complete result.
 - `body` (unknown): Request body data (object or JSON string)
 - `useKitchenBilling` (boolean, optional): Enable Kitchen billing
 - `llmOverride` (string, optional): Override the LLM model (e.g., "gpt-4", "claude-3")
+- `thinkingOverride` (string, optional): Standardized runtime thinking level: `off`, `low`, `medium`, `high`, `xhigh`, or `max`
 - `apiKeyOverride` (object, optional): Override API keys for external services
 
 **Returns:** `Promise<KitchenResponse>`
@@ -98,6 +99,7 @@ Execute a recipe with real-time streaming. Yields events as they arrive.
 - `body` (unknown): Request body data
 - `useKitchenBilling` (boolean, optional): Enable Kitchen billing
 - `llmOverride` (string, optional): Override the LLM model (e.g., "gpt-4", "claude-3")
+- `thinkingOverride` (string, optional): Standardized runtime thinking level: `off`, `low`, `medium`, `high`, `xhigh`, or `max`
 - `apiKeyOverride` (object, optional): Override API keys for external services
 
 **Returns:** `AsyncIterable<StreamEvent>`
@@ -193,6 +195,21 @@ for await (const event of client.stream({
 }
 ```
 
+### Thinking Override
+
+Set a standardized runtime thinking level for the selected model. Omit
+`thinkingOverride` to use the recipe/Chef default; `auto` is not sent as a
+runtime override.
+
+```typescript
+const result = await client.sync({
+  recipeId: "abc123",
+  entryId: "def456",
+  body: { message: "Solve this carefully" },
+  thinkingOverride: "high",
+});
+```
+
 ### Combining Options
 
 You can use both options together:
@@ -219,6 +236,7 @@ import type {
   StreamParams,
   StreamEvent,
   StreamEventType,
+  ThinkingLevel,
 } from "@endevre/entry-on-kitchen";
 ```
 
