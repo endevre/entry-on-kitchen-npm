@@ -7,7 +7,7 @@
  * @packageDocumentation
  */
 
-export { KitchenClient, applyDelta } from "./client";
+export { KitchenAuthorizationError, KitchenClient, applyDelta } from "./client";
 export {
   createExternalTool,
   createKitchenEntryTool,
@@ -22,6 +22,9 @@ export {
 } from "./tools";
 export type {
   JSONSchema,
+  BearerAuthorization,
+  EntryCodeAuthorization,
+  KitchenAuthorization,
   KitchenClientConfig,
   KitchenEntryTool,
   KitchenExternalTool,

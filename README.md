@@ -25,7 +25,7 @@ import { KitchenClient } from "@endevre/entry-on-kitchen";
 
 // Initialize the client
 const client = new KitchenClient({
-  authCode: "your-auth-code-here",
+  authorization: { kind: "entry_code", code: "your-auth-code-here" },
   entryPoint: "entry", // or "beta", "raydev", etc.
 });
 
@@ -48,11 +48,18 @@ new KitchenClient(config: KitchenClientConfig)
 ```
 
 **Parameters:**
-- `authCode` (string, required): Your X-Entry-Auth-Code for authentication
+- `authorization` (object, required): Authentication capability. Use `{ kind: "entry_code", code: "..." }` for a static Entry auth code or `{ kind: "bearer", getToken }` for a dynamic bearer token.
 - `entryPoint` (string, optional): Entry point environment. Defaults to `"entry"` (production)
 
 **Throws:**
-- `Error` if `authCode` is not provided
+- `Error` if `authorization` is missing or malformed
+
+Bearer providers are called immediately before every authenticated request
+attempt. The provider receives `{ forceRefresh: false }` normally and
+`{ forceRefresh: true }` for one recovery attempt after an expired-token
+response. The returned string is sent unchanged in the `Authorization` header;
+the client does not add a `Bearer ` prefix. A second authorization failure is
+returned to the caller without retrying again.
 
 ### Methods
 
@@ -136,7 +143,7 @@ for await (const event of client.stream({
 ### Production
 ```typescript
 const client = new KitchenClient({
-  authCode: "your-auth-code",
+  authorization: { kind: "entry_code", code: "your-auth-code" },
   entryPoint: "entry", // Uses https://entry.entry.on.kitchen
 });
 ```
@@ -144,7 +151,7 @@ const client = new KitchenClient({
 ### Beta
 ```typescript
 const client = new KitchenClient({
-  authCode: "your-auth-code",
+  authorization: { kind: "entry_code", code: "your-auth-code" },
   entryPoint: "beta", // Uses https://beta.entry.on.kitchen
 });
 ```
@@ -152,10 +159,31 @@ const client = new KitchenClient({
 ### Custom Environment
 ```typescript
 const client = new KitchenClient({
-  authCode: "your-auth-code",
+  authorization: { kind: "entry_code", code: "your-auth-code" },
   entryPoint: "raydev", // Uses https://raydev.entry.on.kitchen
 });
 ```
+
+### Dynamic bearer authorization
+
+Pass a function instead of a token when the session can refresh. Keep token
+storage and refresh ownership in the provider (for example, your ID client):
+
+```typescript
+const client = new KitchenClient({
+  authorization: {
+    kind: "bearer",
+    getToken: ({ forceRefresh }) => idClient.getToken({ forceRefresh }),
+  },
+});
+```
+
+Kitchen retries one initial request after an HTTP 401 or the runner's exact
+`Authorization expired or invalid` response. It never retries a generic 403,
+static Entry auth codes, or a request after a run has emitted an identity or
+meaningful stream event. Poll and resumed-stream requests reacquire the token
+while preserving their existing run ID. Signed final-payload URLs are fetched
+without authentication headers.
 
 ## Optional Features
 
@@ -230,6 +258,9 @@ This library is written in TypeScript and includes full type definitions:
 
 ```typescript
 import type {
+  BearerAuthorization,
+  EntryCodeAuthorization,
+  KitchenAuthorization,
   KitchenClientConfig,
   KitchenResponse,
   SyncParams,
@@ -246,7 +277,7 @@ import type {
 import { KitchenClient } from "@endevre/entry-on-kitchen";
 
 const client = new KitchenClient({
-  authCode: "your-auth-code",
+  authorization: { kind: "entry_code", code: "your-auth-code" },
 });
 
 try {
@@ -268,9 +299,11 @@ try {
 }
 ```
 
-## Migration from v0.2.x
+## Migration from v0.3.x
 
-Version 0.3.0 is a breaking change from v0.2.x. See [MIGRATION.md](./MIGRATION.md) for detailed migration instructions.
+Version 0.4.0 replaces the `authCode` and `useAuthorizationHeader` options
+with the explicit `authorization` capability. The quick migration below also
+shows the earlier EntryBlock API for reference.
 
 ### Quick Migration
 
@@ -289,12 +322,12 @@ const result = entry.runSync({ message: "Hello!" });
 const result = await entry.runAsync({ message: "Hello!" });
 ```
 
-**After (v0.3.0):**
+**After (v0.4.0):**
 ```typescript
 import { KitchenClient } from "@endevre/entry-on-kitchen";
 
 const client = new KitchenClient({
-  authCode: "your-auth-code",
+  authorization: { kind: "entry_code", code: "your-auth-code" },
   entryPoint: "beta",
 });
 
