@@ -2,7 +2,10 @@
   "name": "@endevre/entry-on-kitchen",
   "version": "0.4.0",
   "description": "Official JavaScript/TypeScript library for Entry on Kitchen API",
-  "repository": "endevre/entry-on-kitchen-npm",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/endevre/entry-on-kitchen-npm.git"
+  },
   "license": "ISC",
   "publishConfig": {
     "access": "public"
