@@ -15,6 +15,7 @@ import type {
   ResumableStreamParams,
   AgentRunMetadata,
   ThinkingLevel,
+  KitchenAuthorization,
 } from "./types";
 import {
   createToolError,
@@ -27,6 +28,17 @@ import {
 type HeadersObject = Record<string, string>;
 
 const THINKING_LEVELS = new Set<ThinkingLevel>(["off", "low", "medium", "high", "xhigh", "max"]);
+const AUTHORIZATION_EXPIRED_MESSAGE = "Authorization expired or invalid";
+
+/** A safe error raised when a bearer provider cannot supply a usable token. */
+export class KitchenAuthorizationError extends Error {
+  readonly code = "KITCHEN_AUTHORIZATION_ERROR";
+
+  constructor(message = "Unable to obtain authorization for the Kitchen request") {
+    super(message);
+    this.name = "KitchenAuthorizationError";
+  }
+}
 
 function normalizeThinkingOverride(value: ThinkingLevel | undefined): ThinkingLevel | undefined {
   if (value === undefined || value === null || String(value).trim() === "") {
@@ -95,7 +107,7 @@ export function applyDelta(original: string, delta: DeltaOperation[]): string {
  * @example
  * ```ts
  * const client = new KitchenClient({
- *   authCode: "your-auth-code",
+ *   authorization: { kind: "entry_code", code: "your-auth-code" },
  *   entryPoint: "beta"
  * });
  *
@@ -117,26 +129,36 @@ export function applyDelta(original: string, delta: DeltaOperation[]): string {
  * ```
  */
 export class KitchenClient {
-  private readonly authCode: string;
+  private readonly authorization: KitchenAuthorization;
   private readonly entryPoint: string;
-  private readonly useAuthorizationHeader: boolean;
 
   /**
    * Create a new KitchenClient instance
    *
    * @param config - Client configuration
-   * @throws {Error} If authCode is not provided
+   * @throws {Error} If authorization is missing or malformed
    */
   constructor(config: KitchenClientConfig) {
-    const { authCode, entryPoint = "entry", useAuthorizationHeader = false } = config;
+    const { authorization, entryPoint = "entry" } = config || {};
 
-    if (!authCode) {
-      throw new Error("authCode is required");
+    if (!authorization) {
+      throw new Error("authorization is required");
     }
 
-    this.authCode = authCode;
+    if (authorization.kind === "entry_code") {
+      if (!authorization.code || typeof authorization.code !== "string") {
+        throw new Error("authorization.code is required for entry_code authorization");
+      }
+    } else if (authorization.kind === "bearer") {
+      if (typeof authorization.getToken !== "function") {
+        throw new Error("authorization.getToken is required for bearer authorization");
+      }
+    } else {
+      throw new Error("authorization.kind must be entry_code or bearer");
+    }
+
+    this.authorization = authorization;
     this.entryPoint = entryPoint;
-    this.useAuthorizationHeader = useAuthorizationHeader;
   }
 
   /**
@@ -178,25 +200,53 @@ export class KitchenClient {
     return `https://${this.entryPoint}.api.on.kitchen`;
   }
 
+  private isAuthorizationHeader(name: string): boolean {
+    const normalized = name.toLowerCase();
+    return normalized === "authorization" || normalized === "x-entry-auth-code";
+  }
+
+  private async getAuthorizationValue(forceRefresh = false): Promise<HeadersObject> {
+    if (this.authorization.kind === "entry_code") {
+      return { "X-Entry-Auth-Code": this.authorization.code };
+    }
+
+    let token: string;
+    try {
+      token = await this.authorization.getToken({ forceRefresh });
+    } catch {
+      throw new KitchenAuthorizationError();
+    }
+
+    if (typeof token !== "string" || token.trim() === "") {
+      throw new KitchenAuthorizationError();
+    }
+
+    // The provider owns the wire format. Preserve raw values and do not add a
+    // Bearer prefix because some Kitchen deployments use another scheme.
+    return { Authorization: token };
+  }
+
   /**
-   * Get standard headers for API requests
+   * Get standard headers for API requests. Authentication headers are always
+   * written last so caller-provided headers cannot replace them.
    */
-  private getHeaders(customHeaders?: Record<string, string>): HeadersObject {
+  private async getHeaders(
+    customHeaders?: Record<string, string>,
+    forceRefresh = false,
+  ): Promise<HeadersObject> {
     const headers: HeadersObject = {
       "Content-Type": "application/json",
     };
 
-    if (this.useAuthorizationHeader) {
-      headers["Authorization"] = this.authCode;
-    } else {
-      headers["X-Entry-Auth-Code"] = this.authCode;
-    }
-
-    // Merge custom headers (they can override defaults if needed)
     if (customHeaders) {
-      Object.assign(headers, customHeaders);
+      for (const [name, value] of Object.entries(customHeaders)) {
+        if (!this.isAuthorizationHeader(name)) {
+          headers[name] = value;
+        }
+      }
     }
 
+    Object.assign(headers, await this.getAuthorizationValue(forceRefresh));
     return headers;
   }
 
@@ -307,25 +357,40 @@ export class KitchenClient {
     body: string,
     customHeaders?: Record<string, string>,
   ): Promise<HttpResponse> {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: this.getHeaders(customHeaders),
-      body,
-    });
+    let forceRefresh = false;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: await this.getHeaders(customHeaders, forceRefresh),
+        body,
+      });
 
-    const data = await this.parseResponse(response);
+      const data = await this.parseResponse(response);
+      if (attempt === 0 && this.shouldRetryInitialRequest(response.status, data)) {
+        forceRefresh = true;
+        continue;
+      }
 
-    return {
-      data,
-      status: response.status,
-      statusText: response.statusText,
-    };
+      return {
+        data,
+        status: response.status,
+        statusText: response.statusText,
+      };
+    }
+
+    throw new Error("HTTP request failed");
   }
 
   /**
    * Parse response JSON gracefully
    */
   private async parseResponse(response: Response): Promise<unknown> {
+    if (typeof response.text !== "function") {
+      if (typeof response.json === "function") {
+        return await response.json();
+      }
+      return "";
+    }
     const text = await response.text();
     if (!text) {
       return "";
@@ -337,15 +402,63 @@ export class KitchenClient {
     }
   }
 
-  private async fetchJson<T>(url: string): Promise<T> {
-    const response = await fetch(url, {
-      method: "GET",
-      headers: this.getHeaders(),
-    });
-    if (!response.ok) {
+  private canRefreshAuthorization(): boolean {
+    return this.authorization.kind === "bearer";
+  }
+
+  private hasRunIdentity(value: unknown): boolean {
+    if (!value || typeof value !== "object") return false;
+    const record = value as Record<string, unknown>;
+    if (typeof record.runId === "string" && record.runId.trim() !== "") {
+      return true;
+    }
+    return Boolean(record.data && typeof record.data === "object" && this.hasRunIdentity(record.data));
+  }
+
+  private isAuthorizationExpiredPayload(value: unknown): boolean {
+    if (typeof value === "string") {
+      return value.trim() === AUTHORIZATION_EXPIRED_MESSAGE;
+    }
+    if (!value || typeof value !== "object") return false;
+    const record = value as Record<string, unknown>;
+    return record.error === AUTHORIZATION_EXPIRED_MESSAGE ||
+      record.error_message === AUTHORIZATION_EXPIRED_MESSAGE;
+  }
+
+  private shouldRetryAuthorization(status: number, data: unknown): boolean {
+    return status === 401 || this.isAuthorizationExpiredPayload(data);
+  }
+
+  private shouldRetryInitialRequest(status: number, data: unknown): boolean {
+    return this.canRefreshAuthorization() &&
+      this.shouldRetryAuthorization(status, data) &&
+      !this.hasRunIdentity(data);
+  }
+
+  private async fetchJson<T>(url: string, knownRunId?: string): Promise<T> {
+    let forceRefresh = false;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const response = await fetch(url, {
+        method: "GET",
+        headers: await this.getHeaders(undefined, forceRefresh),
+      });
+      const data = await this.parseResponse(response);
+      if (response.ok) {
+        return data as T;
+      }
+
+      const canRetry = this.canRefreshAuthorization() &&
+        this.shouldRetryAuthorization(response.status, data) &&
+        (Boolean(knownRunId) || !this.hasRunIdentity(data));
+      if (attempt === 0 && canRetry) {
+        forceRefresh = true;
+        continue;
+      }
+
       throw new Error(`HTTP error! status: ${response.status}`);
     }
-    return await response.json() as T;
+
+    throw new Error("HTTP request failed");
   }
 
   private parseSseFrame(frame: string): StreamEvent | null {
@@ -380,6 +493,13 @@ export class KitchenClient {
     } catch {
       return null;
     }
+  }
+
+  private isAuthorizationFailureEvent(event: StreamEvent): boolean {
+    if (event.type !== "end" && event.type !== "error") return false;
+    const data = typeof event.data === "string" ? this.parseStreamEvent(event.data) || event.data : event.data;
+    if (event.runId || this.hasRunIdentity(data)) return false;
+    return this.isAuthorizationExpiredPayload(data);
   }
 
   private async *readSseResponse(response: Response): AsyncIterable<StreamEvent> {
@@ -417,6 +537,16 @@ export class KitchenClient {
       }
     } finally {
       reader.releaseLock();
+    }
+  }
+
+  private async cancelResponseBody(response: Response): Promise<void> {
+    if (!response.body) return;
+    try {
+      await response.body.cancel();
+    } catch {
+      // Cancellation is cleanup for an abandoned auth response. A browser may
+      // already have closed the body, which must not prevent the bounded retry.
     }
   }
 
@@ -559,6 +689,7 @@ export class KitchenClient {
   async getPipelineRun(runId: string): Promise<PipelineRunStatus> {
     const response = await this.fetchJson<{ pipelineRun: PipelineRunStatus }>(
       `${this.getApiBaseUrl()}/pipelineruns/${runId}`,
+      runId,
     );
     return response.pipelineRun;
   }
@@ -573,6 +704,7 @@ export class KitchenClient {
     const query = params.toString();
     return await this.fetchJson<PipelineRunEventsResponse>(
       `${this.getApiBaseUrl()}/pipelineruns/${runId}/events${query ? `?${query}` : ""}`,
+      runId,
     );
   }
 
@@ -593,11 +725,42 @@ export class KitchenClient {
   ): AsyncIterable<StreamEvent> {
     const params = new URLSearchParams();
     params.set("after", String(options.after || 0));
-    const response = await fetch(`${this.getBaseUrl()}/resumestream/${runId}?${params.toString()}`, {
-      method: "GET",
-      headers: this.getHeaders(),
-    });
-    yield* this.readSseResponse(response);
+    let forceRefresh = false;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const response = await fetch(`${this.getBaseUrl()}/resumestream/${runId}?${params.toString()}`, {
+        method: "GET",
+        headers: await this.getHeaders(undefined, forceRefresh),
+      });
+
+      if (!response.ok) {
+        const data = await this.parseResponse(response);
+        if (attempt === 0 && this.canRefreshAuthorization() &&
+          this.shouldRetryAuthorization(response.status, data)) {
+          forceRefresh = true;
+          continue;
+        }
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      let sawMeaningfulEvent = false;
+      let retry = false;
+      for await (const event of this.readSseResponse(response)) {
+        if (!sawMeaningfulEvent && this.isAuthorizationFailureEvent(event) &&
+          attempt === 0 && this.canRefreshAuthorization()) {
+          retry = true;
+          break;
+        }
+        sawMeaningfulEvent = true;
+        yield await this.hydrateTerminalEvent(event);
+      }
+
+      if (retry) {
+        await this.cancelResponseBody(response);
+        forceRefresh = true;
+        continue;
+      }
+      return;
+    }
   }
 
   private isFinalPayloadRef(value: unknown): value is PipelineRunFinalPayloadRef {
@@ -829,6 +992,123 @@ export class KitchenClient {
    * }
    * ```
    */
+  private async *readRecipeStream(response: Response): AsyncIterable<StreamEvent> {
+    // The API returns either Server-Sent Events with a "data:" prefix or raw
+    // concatenated JSON objects. Keep both formats for compatibility.
+    const reader = response.body?.getReader();
+    if (!reader) {
+      throw new Error("No response body");
+    }
+
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    const extractCompleteJsonObjects = (input: string): string[] => {
+      const objects: string[] = [];
+      let depth = 0;
+      let inString = false;
+      let escapeNext = false;
+      let startIdx = -1;
+
+      for (let i = 0; i < input.length; i++) {
+        const char = input[i];
+        if (escapeNext) {
+          escapeNext = false;
+          continue;
+        }
+        if (char === "\\") {
+          escapeNext = true;
+          continue;
+        }
+        if (char === '"') {
+          inString = !inString;
+          continue;
+        }
+        if (!inString) {
+          if (char === "{") {
+            if (depth === 0) startIdx = i;
+            depth++;
+          } else if (char === "}") {
+            depth--;
+            if (depth === 0 && startIdx !== -1) {
+              objects.push(input.substring(startIdx, i + 1));
+              startIdx = -1;
+            }
+          }
+        }
+      }
+      return objects;
+    };
+
+    const parseAndYield = async function* (
+      self: KitchenClient,
+      value: string,
+      extractObjects: boolean,
+    ): AsyncIterable<StreamEvent> {
+      const parsed = self.parseStreamEvent(value);
+      if (parsed) {
+        yield parsed;
+        return;
+      }
+      if (!extractObjects) return;
+      for (const objectString of extractCompleteJsonObjects(value)) {
+        const object = self.parseStreamEvent(objectString);
+        if (object) yield object;
+      }
+    };
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (value) buffer += decoder.decode(value, { stream: true });
+
+        if (done) {
+          if (buffer.trim()) {
+            for (const line of buffer.split("data:")) {
+              const trimmed = line.trim();
+              if (!trimmed) continue;
+              yield* parseAndYield(this, trimmed, true);
+            }
+          }
+          break;
+        }
+
+        if (buffer.includes("data:")) {
+          const lines = buffer.split("data:");
+          const lastLine = lines[lines.length - 1].trim();
+          const allButLastComplete = !lastLine || lastLine.endsWith("}") || lastLine.endsWith("]");
+          const linesToProcess = allButLastComplete ? lines.length : lines.length - 1;
+          let processedChars = 0;
+
+          for (let i = 0; i < linesToProcess; i++) {
+            const line = lines[i].trim();
+            if (line) yield* parseAndYield(this, line, true);
+            processedChars += line.length + 5;
+          }
+
+          if (processedChars > 0 && processedChars < buffer.length) {
+            buffer = buffer.substring(processedChars);
+          } else if (linesToProcess === lines.length) {
+            buffer = "";
+          }
+        } else {
+          const objects = extractCompleteJsonObjects(buffer);
+          let lastEndIdx = 0;
+          for (const objectString of objects) {
+            const object = this.parseStreamEvent(objectString);
+            if (object) {
+              yield object;
+              lastEndIdx += objectString.length;
+            }
+          }
+          buffer = buffer.substring(lastEndIdx);
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  }
+
   async *stream(params: StreamParams): AsyncIterable<StreamEvent> {
     const {
       recipeId,
@@ -849,171 +1129,43 @@ export class KitchenClient {
       apiKeyOverride,
       thinkingOverride,
     );
+    const requestHeaders = this.mergeHeaders(headers, agentMetadata);
 
-    const response = await fetch(url, {
-      method: "POST",
-      headers: this.getHeaders(this.mergeHeaders(headers, agentMetadata)),
-      body: stringifiedBody,
-    });
+    let forceRefresh = false;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: await this.getHeaders(requestHeaders, forceRefresh),
+        body: stringifiedBody,
+      });
 
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
-
-    // The API returns either:
-    // 1. Server-Sent Events with "data:" prefix: data:{...}data:{...}
-    // 2. Raw concatenated JSON objects: {...}{...}{...}
-    const reader = response.body?.getReader();
-    if (!reader) {
-      throw new Error("No response body");
-    }
-
-    const decoder = new TextDecoder();
-    let buffer = "";
-
-    // Helper function to extract complete JSON objects from buffer
-    function extractCompleteJsonObjects(input: string): string[] {
-      const objects: string[] = [];
-      let depth = 0;
-      let inString = false;
-      let escapeNext = false;
-      let startIdx = -1;
-
-      for (let i = 0; i < input.length; i++) {
-        const char = input[i];
-
-        if (escapeNext) {
-          escapeNext = false;
+      if (!response.ok) {
+        const data = await this.parseResponse(response);
+        if (attempt === 0 && this.shouldRetryInitialRequest(response.status, data)) {
+          forceRefresh = true;
           continue;
         }
-
-        if (char === "\\") {
-          escapeNext = true;
-          continue;
-        }
-
-        if (char === '"') {
-          inString = !inString;
-          continue;
-        }
-
-        if (!inString) {
-          if (char === "{") {
-            if (depth === 0) {
-              startIdx = i;
-            }
-            depth++;
-          } else if (char === "}") {
-            depth--;
-            if (depth === 0 && startIdx !== -1) {
-              objects.push(input.substring(startIdx, i + 1));
-              startIdx = -1;
-            }
-          }
-        }
+        throw new Error(`HTTP error! status: ${response.status}`);
       }
 
-      return objects;
-    }
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-
-        // Decode chunk and accumulate
-        if (value) {
-          buffer += decoder.decode(value, { stream: true });
-        }
-
-        if (done) {
-          // Process any remaining data in buffer
-          if (buffer.trim()) {
-            // Try SSE format first
-            const lines = buffer.split("data:");
-            for (const line of lines) {
-              const trimmedLine = line.trim();
-              if (!trimmedLine) {
-                continue;
-              }
-
-              const obj = this.parseStreamEvent(trimmedLine);
-              if (obj) {
-                yield await this.hydrateTerminalEvent(obj);
-              } else {
-                // Try concatenated format
-                const objects = extractCompleteJsonObjects(trimmedLine);
-                for (const objStr of objects) {
-                  const parsedObject = this.parseStreamEvent(objStr);
-                  if (parsedObject) yield await this.hydrateTerminalEvent(parsedObject);
-                }
-              }
-            }
-          }
+      let sawMeaningfulEvent = false;
+      let retry = false;
+      for await (const event of this.readRecipeStream(response)) {
+        if (!sawMeaningfulEvent && attempt === 0 && this.canRefreshAuthorization() &&
+          this.isAuthorizationFailureEvent(event)) {
+          retry = true;
           break;
         }
-
-        // Try to parse and yield complete objects as they arrive
-        // SSE format: split by "data:" and try to parse each complete line
-        if (buffer.includes("data:")) {
-          const lines = buffer.split("data:");
-          let allButLastComplete = true;
-
-          // Check if the last line is complete (ends with } or ])
-          const lastLine = lines[lines.length - 1];
-          const lastLineTrimmed = lastLine.trim();
-          if (lastLineTrimmed && !lastLineTrimmed.endsWith("}") && !lastLineTrimmed.endsWith("]")) {
-            allButLastComplete = false;
-          }
-
-          // Process all complete lines
-          const linesToProcess = allButLastComplete ? lines.length : lines.length - 1;
-          let processedChars = 0;
-
-          for (let i = 0; i < linesToProcess; i++) {
-            const line = lines[i].trim();
-            if (line) {
-              const obj = this.parseStreamEvent(line);
-              if (obj) {
-                yield await this.hydrateTerminalEvent(obj);
-              } else {
-                // Try concatenated format
-                const objects = extractCompleteJsonObjects(line);
-                for (const objStr of objects) {
-                  const parsedObject = this.parseStreamEvent(objStr);
-                  if (parsedObject) yield await this.hydrateTerminalEvent(parsedObject);
-                }
-              }
-            }
-            processedChars += line.length + 5; // +5 for "data:"
-          }
-
-          // Remove processed data from buffer
-          if (processedChars > 0 && processedChars < buffer.length) {
-            buffer = buffer.substring(processedChars);
-          } else if (linesToProcess === lines.length) {
-            buffer = "";
-          }
-        } else {
-          // No SSE format, try concatenated JSON
-          const objects = extractCompleteJsonObjects(buffer);
-          let lastEndIdx = 0;
-
-          for (const objStr of objects) {
-            const obj = this.parseStreamEvent(objStr);
-            if (obj) {
-              yield await this.hydrateTerminalEvent(obj);
-              lastEndIdx += objStr.length;
-            } else {
-              // Skip invalid JSON
-            }
-          }
-
-          // Keep unprocessed data in buffer
-          buffer = buffer.substring(lastEndIdx);
-        }
+        sawMeaningfulEvent = true;
+        yield await this.hydrateTerminalEvent(event);
       }
-    } finally {
-      reader.releaseLock();
+
+      if (retry) {
+        await this.cancelResponseBody(response);
+        forceRefresh = true;
+        continue;
+      }
+      return;
     }
   }
 

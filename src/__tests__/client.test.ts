@@ -35,23 +35,27 @@ describe("KitchenClient", () => {
 
   describe("constructor", () => {
     it("should create a client with auth code", () => {
-      client = new KitchenClient({ authCode: "test-code" });
+      client = new KitchenClient({
+        authorization: { kind: "entry_code", code: "test-code" },
+      });
       expect(client).toBeDefined();
     });
 
-    it("should throw error if authCode is not provided", () => {
-      expect(() => new KitchenClient({ authCode: "" })).toThrow("authCode is required");
+    it("should throw error if authorization is not provided", () => {
+      expect(() => new KitchenClient({ authorization: undefined as never })).toThrow("authorization is required");
     });
 
     it("should use default entry point 'entry'", () => {
-      client = new KitchenClient({ authCode: "test-code" });
+      client = new KitchenClient({
+        authorization: { kind: "entry_code", code: "test-code" },
+      });
       // Client is created successfully
       expect(client).toBeDefined();
     });
 
     it("should use custom entry point", () => {
       client = new KitchenClient({
-        authCode: "test-code",
+        authorization: { kind: "entry_code", code: "test-code" },
         entryPoint: "beta",
       });
       expect(client).toBeDefined();
@@ -60,7 +64,10 @@ describe("KitchenClient", () => {
 
   describe("sync", () => {
     beforeEach(() => {
-      client = new KitchenClient({ authCode: "test-auth-code", entryPoint: "raydev" });
+      client = new KitchenClient({
+        authorization: { kind: "entry_code", code: "test-auth-code" },
+        entryPoint: "raydev",
+      });
     });
 
     it("should execute sync request successfully", async () => {
@@ -251,7 +258,10 @@ describe("KitchenClient", () => {
 
   describe("tools", () => {
     beforeEach(() => {
-      client = new KitchenClient({ authCode: "test-auth-code", entryPoint: "raydev" });
+      client = new KitchenClient({
+        authorization: { kind: "entry_code", code: "test-auth-code" },
+        entryPoint: "raydev",
+      });
     });
 
     it("should build canonical tool and tool result payloads", () => {
@@ -393,7 +403,10 @@ describe("KitchenClient", () => {
 
   describe("stream", () => {
     beforeEach(() => {
-      client = new KitchenClient({ authCode: "test-auth-code", entryPoint: "raydev" });
+      client = new KitchenClient({
+        authorization: { kind: "entry_code", code: "test-auth-code" },
+        entryPoint: "raydev",
+      });
     });
 
     it("should stream events correctly", async () => {
@@ -778,9 +791,274 @@ describe("KitchenClient", () => {
     });
   });
 
+  describe("authorization", () => {
+    const jsonResponse = (data: unknown, status = 200) => ({
+      ok: status >= 200 && status < 300,
+      status,
+      statusText: status === 200 ? "OK" : "Unauthorized",
+      headers: new Headers(),
+      text: async () => JSON.stringify(data),
+    });
+
+    it("acquires bearer tokens immediately and protects auth headers from overrides", async () => {
+      const getToken = vi.fn().mockResolvedValue("raw-token");
+      client = new KitchenClient({
+        authorization: { kind: "bearer", getToken },
+        entryPoint: "raydev",
+      });
+      mockFetch.mockResolvedValueOnce(jsonResponse({ status: "finished" }));
+
+      await client.sync({
+        recipeId: "recipe",
+        entryId: "entry",
+        body: {},
+        headers: {
+          Authorization: "stale-token",
+          "x-entry-auth-code": "stale-code",
+          "X-Custom": "custom",
+        },
+      });
+
+      expect(getToken).toHaveBeenCalledTimes(1);
+      expect(getToken).toHaveBeenCalledWith({ forceRefresh: false });
+      expect(mockFetch.mock.calls[0]?.[1]).toEqual(expect.objectContaining({
+        headers: {
+          "Content-Type": "application/json",
+          "X-Custom": "custom",
+          Authorization: "raw-token",
+        },
+      }));
+    });
+
+    it("refreshes and retries exactly once after an HTTP 401", async () => {
+      const getToken = vi.fn()
+        .mockResolvedValueOnce("expired-token")
+        .mockResolvedValueOnce("fresh-token");
+      client = new KitchenClient({ authorization: { kind: "bearer", getToken } });
+      mockFetch
+        .mockResolvedValueOnce(jsonResponse({ status: "error", error: "unauthorized" }, 401))
+        .mockResolvedValueOnce(jsonResponse({ status: "finished", result: "ok" }));
+
+      const result = await client.sync({ recipeId: "recipe", entryId: "entry", body: {} });
+
+      expect(result.status).toBe("finished");
+      expect(getToken.mock.calls).toEqual([[{ forceRefresh: false }], [{ forceRefresh: true }]]);
+      expect(mockFetch.mock.calls[0]?.[1]).toEqual(expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: "expired-token" }),
+      }));
+      expect(mockFetch.mock.calls[1]?.[1]).toEqual(expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: "fresh-token" }),
+      }));
+    });
+
+    it("refreshes on the exact runner authorization-expired payload", async () => {
+      const getToken = vi.fn()
+        .mockResolvedValueOnce("expired-token")
+        .mockResolvedValueOnce("fresh-token");
+      client = new KitchenClient({ authorization: { kind: "bearer", getToken } });
+      mockFetch
+        .mockResolvedValueOnce(jsonResponse({ runId: null, status: "error", error: "Authorization expired or invalid" }, 400))
+        .mockResolvedValueOnce(jsonResponse({ status: "finished" }));
+
+      await client.sync({ recipeId: "recipe", entryId: "entry", body: {} });
+
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      expect(getToken).toHaveBeenCalledTimes(2);
+      expect(getToken).toHaveBeenLastCalledWith({ forceRefresh: true });
+    });
+
+    it("does not refresh generic permission failures or a response with a run identity", async () => {
+      const getToken = vi.fn().mockResolvedValue("token");
+      client = new KitchenClient({ authorization: { kind: "bearer", getToken } });
+
+      mockFetch.mockResolvedValueOnce(jsonResponse({ error: "forbidden" }, 403));
+      const forbidden = await client.sync({ recipeId: "recipe", entryId: "entry", body: {} });
+      expect(forbidden._statusCode).toBe(403);
+      expect(getToken).toHaveBeenCalledTimes(1);
+
+      mockFetch.mockResolvedValueOnce(jsonResponse({ runId: "run-1", error: "expired" }, 401));
+      const runResponse = await client.sync({ recipeId: "recipe", entryId: "entry", body: {} });
+      expect(runResponse._statusCode).toBe(401);
+      expect(getToken).toHaveBeenCalledTimes(2);
+    });
+
+    it("surfaces a safe error when the token provider fails", async () => {
+      const getToken = vi.fn().mockRejectedValue(new Error("secret-token should not leak"));
+      client = new KitchenClient({ authorization: { kind: "bearer", getToken } });
+
+      await expect(client.sync({ recipeId: "recipe", entryId: "entry", body: {} }))
+        .rejects.toMatchObject({
+          name: "KitchenAuthorizationError",
+          code: "KITCHEN_AUTHORIZATION_ERROR",
+          message: expect.not.stringContaining("secret-token"),
+        });
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it("refreshes an initial stream when the runner sends an auth error before any run event", async () => {
+      const getToken = vi.fn()
+        .mockResolvedValueOnce("expired-token")
+        .mockResolvedValueOnce("fresh-token");
+      client = new KitchenClient({ authorization: { kind: "bearer", getToken } });
+      const abandonedBody = sseStream([{
+        runId: null,
+        type: "end",
+        time: 1,
+        data: { runId: null, status: "error", error: "Authorization expired or invalid" },
+        statusCode: 400,
+      }]);
+      const cancelAbandonedBody = vi.spyOn(abandonedBody, "cancel");
+      mockFetch
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          body: abandonedBody,
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          body: sseStream([
+            { runId: "run-1", type: "progress", time: 2, data: {}, statusCode: 200 },
+            { runId: "run-1", type: "end", time: 3, data: { status: "finished" }, statusCode: 200 },
+          ]),
+        });
+
+      const events: StreamEvent[] = [];
+      for await (const event of client.stream({ recipeId: "recipe", entryId: "entry", body: {} })) {
+        events.push(event);
+      }
+
+      expect(events.map((event) => event.type)).toEqual(["progress", "end"]);
+      expect(getToken.mock.calls).toEqual([[{ forceRefresh: false }], [{ forceRefresh: true }]]);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      expect(cancelAbandonedBody).toHaveBeenCalledTimes(1);
+    });
+
+    it("cancels only the abandoned body and bounds initial stream auth recovery to one retry", async () => {
+      const getToken = vi.fn()
+        .mockResolvedValueOnce("expired-token")
+        .mockResolvedValueOnce("still-expired-token");
+      client = new KitchenClient({ authorization: { kind: "bearer", getToken } });
+      const authEvent: StreamEvent = {
+        runId: null,
+        type: "end",
+        time: 1,
+        data: { error: "Authorization expired or invalid" },
+        statusCode: 400,
+      };
+      const abandonedBody = sseStream([authEvent]);
+      const surfacedBody = sseStream([{ ...authEvent, time: 2 }]);
+      const cancelAbandonedBody = vi.spyOn(abandonedBody, "cancel");
+      const cancelSurfacedBody = vi.spyOn(surfacedBody, "cancel");
+      mockFetch
+        .mockResolvedValueOnce({ ok: true, status: 200, body: abandonedBody })
+        .mockResolvedValueOnce({ ok: true, status: 200, body: surfacedBody });
+
+      const events: StreamEvent[] = [];
+      for await (const event of client.stream({ recipeId: "recipe", entryId: "entry", body: {} })) {
+        events.push(event);
+      }
+
+      expect(events).toHaveLength(1);
+      expect(events[0]?.data).toEqual({ error: "Authorization expired or invalid" });
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      expect(getToken.mock.calls).toEqual([[{ forceRefresh: false }], [{ forceRefresh: true }]]);
+      expect(cancelAbandonedBody).toHaveBeenCalledTimes(1);
+      expect(cancelSurfacedBody).not.toHaveBeenCalled();
+    });
+
+    it("cancels an abandoned resumed-stream body before retrying the same run", async () => {
+      const getToken = vi.fn()
+        .mockResolvedValueOnce("expired-token")
+        .mockResolvedValueOnce("fresh-token");
+      client = new KitchenClient({ authorization: { kind: "bearer", getToken } });
+      const abandonedBody = sseStream([{
+        runId: null,
+        type: "end",
+        time: 1,
+        data: { error: "Authorization expired or invalid" },
+        statusCode: 400,
+      }]);
+      const cancelAbandonedBody = vi.spyOn(abandonedBody, "cancel");
+      mockFetch
+        .mockResolvedValueOnce({ ok: true, status: 200, body: abandonedBody })
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          body: sseStream([{
+            runId: "run-1",
+            type: "end",
+            time: 2,
+            data: { status: "finished" },
+            statusCode: 200,
+          }]),
+        });
+
+      const events: StreamEvent[] = [];
+      for await (const event of client.resumePipelineRunStream("run-1")) {
+        events.push(event);
+      }
+
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({ runId: "run-1", type: "end" });
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      expect(mockFetch.mock.calls[0]?.[0]).toContain("/resumestream/run-1?");
+      expect(mockFetch.mock.calls[1]?.[0]).toContain("/resumestream/run-1?");
+      expect(getToken.mock.calls).toEqual([[{ forceRefresh: false }], [{ forceRefresh: true }]]);
+      expect(cancelAbandonedBody).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not create another stream after a meaningful event", async () => {
+      const getToken = vi.fn().mockResolvedValue("token");
+      client = new KitchenClient({ authorization: { kind: "bearer", getToken } });
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        body: sseStream([
+          { runId: "run-1", type: "progress", time: 1, data: {}, statusCode: 200 },
+          { runId: null, type: "end", time: 2, data: { error: "Authorization expired or invalid" }, statusCode: 400 },
+        ]),
+      });
+
+      const events: StreamEvent[] = [];
+      for await (const event of client.stream({ recipeId: "recipe", entryId: "entry", body: {} })) {
+        events.push(event);
+      }
+
+      expect(events.map((event) => event.type)).toEqual(["progress", "end"]);
+      expect(getToken).toHaveBeenCalledTimes(1);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("acquires a token for every poll attempt", async () => {
+      const getToken = vi.fn()
+        .mockResolvedValueOnce("token-1")
+        .mockResolvedValueOnce("token-2");
+      client = new KitchenClient({ authorization: { kind: "bearer", getToken } });
+      mockFetch
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          json: async () => ({ pipelineRun: { runId: "run-1", status: "running" } }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          json: async () => ({ pipelineRun: { runId: "run-1", status: "finished" } }),
+        });
+
+      await client.getPipelineRun("run-1");
+      await client.getPipelineRun("run-1");
+      expect(getToken.mock.calls).toEqual([[{ forceRefresh: false }], [{ forceRefresh: false }]]);
+    });
+  });
+
   describe("URL construction", () => {
     it("should construct correct URL for entry point 'entry'", async () => {
-      client = new KitchenClient({ authCode: "test-code", entryPoint: "entry" });
+      client = new KitchenClient({
+        authorization: { kind: "entry_code", code: "test-code" },
+        entryPoint: "entry",
+      });
 
       mockFetch.mockResolvedValue({
         ok: true,
@@ -803,7 +1081,10 @@ describe("KitchenClient", () => {
     });
 
     it("should construct correct URL for custom entry point", async () => {
-      client = new KitchenClient({ authCode: "test-code", entryPoint: "beta" });
+      client = new KitchenClient({
+        authorization: { kind: "entry_code", code: "test-code" },
+        entryPoint: "beta",
+      });
 
       mockFetch.mockResolvedValue({
         ok: true,

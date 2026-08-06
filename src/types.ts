@@ -110,7 +110,7 @@ export interface ProgressData {
  */
 export interface StreamEvent {
   /** The execution run ID */
-  runId: string;
+  runId: string | null;
   /** Event type */
   type: StreamEventType;
   /** Durable stream sequence for resumable streams */
@@ -125,16 +125,29 @@ export interface StreamEvent {
   statusCode: number;
 }
 
+/** A static Entry auth code sent in the X-Entry-Auth-Code header. */
+export interface EntryCodeAuthorization {
+  kind: "entry_code";
+  code: string;
+}
+
+/** A bearer token provider. The provider is called before every request attempt. */
+export interface BearerAuthorization {
+  kind: "bearer";
+  getToken: (options: { forceRefresh: boolean }) => Promise<string>;
+}
+
+/** Authentication capability used by KitchenClient. */
+export type KitchenAuthorization = EntryCodeAuthorization | BearerAuthorization;
+
 /**
  * Configuration for KitchenClient
  */
 export interface KitchenClientConfig {
-  /** Your X-Entry-Auth-Code for authentication */
-  authCode: string;
+  /** Authentication capability for this client. */
+  authorization: KitchenAuthorization;
   /** Entry point environment (default: "entry" for production) */
   entryPoint?: string;
-  /** Use Authorization header instead of X-Entry-Auth-Code (optional) */
-  useAuthorizationHeader?: boolean;
 }
 
 /**
