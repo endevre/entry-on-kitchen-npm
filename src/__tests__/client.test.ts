@@ -447,6 +447,38 @@ describe("KitchenClient", () => {
       });
     });
 
+    it("should abort the active stream request", async () => {
+      const controller = new AbortController();
+      let requestSignal: AbortSignal | null | undefined;
+      let markFetchStarted!: () => void;
+      const fetchStarted = new Promise<void>((resolve) => {
+        markFetchStarted = resolve;
+      });
+      mockFetch.mockImplementationOnce((_url, init?: RequestInit) => {
+        requestSignal = init?.signal;
+        markFetchStarted();
+        return new Promise((_resolve, reject) => {
+          requestSignal?.addEventListener("abort", () => reject(requestSignal?.reason), { once: true });
+        });
+      });
+
+      const consuming = (async () => {
+        for await (const _event of client.stream({
+          recipeId: "test-recipe",
+          entryId: "test-entry",
+          body: { message: "Hello!" },
+          signal: controller.signal,
+        })) {
+          // The request remains pending until it is aborted.
+        }
+      })();
+
+      await fetchStarted;
+      expect(requestSignal).toBe(controller.signal);
+      controller.abort(new DOMException("Stopped by user", "AbortError"));
+      await expect(consuming).rejects.toMatchObject({ name: "AbortError", message: "Stopped by user" });
+    });
+
     it("should handle different event types", async () => {
       const streamData =
         '{"runId":"test-id","type":"progress","time":123456,"data":{"blockPosition":1,"blocksToExitBlock":3},"socket":null,"statusCode":200}' +
@@ -628,6 +660,7 @@ describe("KitchenClient", () => {
     });
 
     it("should reconnect a resumable stream after a clean close before terminal event", async () => {
+      const controller = new AbortController();
       mockFetch
         .mockResolvedValueOnce({
           ok: true,
@@ -673,6 +706,7 @@ describe("KitchenClient", () => {
         body: { message: "Hello!" },
         maxReconnects: 1,
         reconnectDelayMs: 0,
+        signal: controller.signal,
       })) {
         events.push(event);
       }
@@ -680,8 +714,63 @@ describe("KitchenClient", () => {
       expect(events.map((event) => event.type)).toEqual(["progress", "end"]);
       expect(mockFetch).toHaveBeenCalledWith(
         "https://raydev.entry.on.kitchen/resumestream/run-1?after=1",
-        expect.objectContaining({ method: "GET" }),
+        expect.objectContaining({ method: "GET", signal: controller.signal }),
       );
+    });
+
+    it("should abort while waiting to reconnect a resumable stream", async () => {
+      const controller = new AbortController();
+      let markStatusRead!: () => void;
+      const statusRead = new Promise<void>((resolve) => {
+        markStatusRead = resolve;
+      });
+      mockFetch
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          body: sseStream([
+            {
+              runId: "run-abort",
+              seq: 1,
+              type: "progress",
+              time: 1,
+              data: { message: "started" },
+              statusCode: 200,
+            },
+          ]),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ runId: "run-abort", events: [], status: "running" }),
+        })
+        .mockImplementationOnce(async () => {
+          markStatusRead();
+          return {
+            ok: true,
+            json: async () => ({ pipelineRun: { runId: "run-abort", status: "running" } }),
+          };
+        });
+
+      const iterator = client.streamResumable({
+        recipeId: "test-recipe",
+        entryId: "test-entry",
+        body: { message: "Hello!" },
+        reconnectDelayMs: 10_000,
+        signal: controller.signal,
+      })[Symbol.asyncIterator]();
+
+      await expect(iterator.next()).resolves.toMatchObject({
+        value: { runId: "run-abort", type: "progress" },
+        done: false,
+      });
+      const reconnecting = iterator.next();
+      await statusRead;
+      controller.abort(new DOMException("Stopped during reconnect", "AbortError"));
+
+      await expect(reconnecting).rejects.toMatchObject({
+        name: "AbortError",
+        message: "Stopped during reconnect",
+      });
     });
 
     it("should synthesize a terminal event from run status when stream events were already cleaned up", async () => {

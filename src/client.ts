@@ -435,12 +435,14 @@ export class KitchenClient {
       !this.hasRunIdentity(data);
   }
 
-  private async fetchJson<T>(url: string, knownRunId?: string): Promise<T> {
+  private async fetchJson<T>(url: string, knownRunId?: string, signal?: AbortSignal): Promise<T> {
     let forceRefresh = false;
     for (let attempt = 0; attempt < 2; attempt++) {
+      signal?.throwIfAborted();
       const response = await fetch(url, {
         method: "GET",
         headers: await this.getHeaders(undefined, forceRefresh),
+        ...(signal ? { signal } : {}),
       });
       const data = await this.parseResponse(response);
       if (response.ok) {
@@ -686,17 +688,21 @@ export class KitchenClient {
     };
   }
 
-  async getPipelineRun(runId: string): Promise<PipelineRunStatus> {
+  async getPipelineRun(
+    runId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<PipelineRunStatus> {
     const response = await this.fetchJson<{ pipelineRun: PipelineRunStatus }>(
       `${this.getApiBaseUrl()}/pipelineruns/${runId}`,
       runId,
+      options.signal,
     );
     return response.pipelineRun;
   }
 
   async getPipelineRunEvents(
     runId: string,
-    options: { after?: number; limit?: number } = {},
+    options: { after?: number; limit?: number; signal?: AbortSignal } = {},
   ): Promise<PipelineRunEventsResponse> {
     const params = new URLSearchParams();
     if (options.after !== undefined) params.set("after", String(options.after));
@@ -705,14 +711,20 @@ export class KitchenClient {
     return await this.fetchJson<PipelineRunEventsResponse>(
       `${this.getApiBaseUrl()}/pipelineruns/${runId}/events${query ? `?${query}` : ""}`,
       runId,
+      options.signal,
     );
   }
 
-  async fetchPipelineRunFinalPayload(ref: PipelineRunFinalPayloadRef): Promise<KitchenResponse> {
+  async fetchPipelineRunFinalPayload(
+    ref: PipelineRunFinalPayloadRef,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<KitchenResponse> {
     if (!ref?.url) {
       throw new Error("Final payload reference does not include a URL");
     }
-    const response = await fetch(ref.url);
+    const response = options.signal
+      ? await fetch(ref.url, { signal: options.signal })
+      : await fetch(ref.url);
     if (!response.ok) {
       throw new Error(`HTTP error! status: ${response.status}`);
     }
@@ -721,7 +733,7 @@ export class KitchenClient {
 
   async *resumePipelineRunStream(
     runId: string,
-    options: { after?: number } = {},
+    options: { after?: number; signal?: AbortSignal } = {},
   ): AsyncIterable<StreamEvent> {
     const params = new URLSearchParams();
     params.set("after", String(options.after || 0));
@@ -730,6 +742,7 @@ export class KitchenClient {
       const response = await fetch(`${this.getBaseUrl()}/resumestream/${runId}?${params.toString()}`, {
         method: "GET",
         headers: await this.getHeaders(undefined, forceRefresh),
+        ...(options.signal ? { signal: options.signal } : {}),
       });
 
       if (!response.ok) {
@@ -751,7 +764,7 @@ export class KitchenClient {
           break;
         }
         sawMeaningfulEvent = true;
-        yield await this.hydrateTerminalEvent(event);
+        yield await this.hydrateTerminalEvent(event, options.signal);
       }
 
       if (retry) {
@@ -774,7 +787,7 @@ export class KitchenClient {
     );
   }
 
-  private async hydrateTerminalEvent(event: StreamEvent): Promise<StreamEvent> {
+  private async hydrateTerminalEvent(event: StreamEvent, signal?: AbortSignal): Promise<StreamEvent> {
     if (event.type !== "end" && event.type !== "error") {
       return event;
     }
@@ -801,7 +814,7 @@ export class KitchenClient {
 
     return {
       ...event,
-      data: await this.fetchPipelineRunFinalPayload(ref),
+      data: await this.fetchPipelineRunFinalPayload(ref, { signal }),
     };
   }
 
@@ -838,9 +851,21 @@ export class KitchenClient {
     };
   }
 
-  private async waitForReconnect(delayMs: number): Promise<void> {
+  private async waitForReconnect(delayMs: number, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
     if (delayMs <= 0) return;
-    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    await new Promise<void>((resolve, reject) => {
+      const onAbort = () => {
+        clearTimeout(timeout);
+        reject(signal?.reason ?? new DOMException("The operation was aborted", "AbortError"));
+      };
+      const timeout = setTimeout(() => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      }, delayMs);
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) onAbort();
+    });
   }
 
   /**
@@ -860,12 +885,14 @@ export class KitchenClient {
       reconnectDelayMs = 250,
       ...streamParams
     } = params;
+    const signal = streamParams.signal;
+    signal?.throwIfAborted();
 
     let runId = initialRunId;
     let lastSeq = afterSeq;
     let reconnects = 0;
     let source: AsyncIterable<StreamEvent> = runId
-      ? this.resumePipelineRunStream(runId, { after: lastSeq })
+      ? this.resumePipelineRunStream(runId, { after: lastSeq, signal })
       : this.stream(streamParams);
 
     const remember = (event: StreamEvent) => {
@@ -884,9 +911,10 @@ export class KitchenClient {
       self: KitchenClient,
       activeRunId: string,
     ): AsyncIterable<{ event: StreamEvent; terminal: boolean }> {
-      const eventSnapshot = await self.getPipelineRunEvents(activeRunId, { after: lastSeq });
+      signal?.throwIfAborted();
+      const eventSnapshot = await self.getPipelineRunEvents(activeRunId, { after: lastSeq, signal });
       for (const rawEvent of eventSnapshot.events || []) {
-        const event = await self.hydrateTerminalEvent(rawEvent);
+        const event = await self.hydrateTerminalEvent(rawEvent, signal);
         remember(event);
         yield { event, terminal: self.isTerminalStreamEvent(event) };
 
@@ -895,13 +923,13 @@ export class KitchenClient {
         }
       }
 
-      const status = await self.getPipelineRun(activeRunId);
+      const status = await self.getPipelineRun(activeRunId, { signal });
       if (self.isPipelineRunActive(status.status)) {
         return;
       }
 
       const finalPayload = status.finalPayloadRef
-        ? await self.fetchPipelineRunFinalPayload(status.finalPayloadRef)
+        ? await self.fetchPipelineRunFinalPayload(status.finalPayloadRef, { signal })
         : status;
       const terminalEvent = self.buildTerminalEventFromRunStatus(
         activeRunId,
@@ -915,10 +943,11 @@ export class KitchenClient {
     };
 
     while (true) {
+      signal?.throwIfAborted();
       try {
         let sawTerminal = false;
         for await (const rawEvent of source) {
-          const event = await this.hydrateTerminalEvent(rawEvent);
+          const event = await this.hydrateTerminalEvent(rawEvent, signal);
           remember(event);
           yield event;
 
@@ -948,9 +977,10 @@ export class KitchenClient {
           if (terminal) return;
         }
 
-        await this.waitForReconnect(reconnectDelayMs);
-        source = this.resumePipelineRunStream(runId, { after: lastSeq });
+        await this.waitForReconnect(reconnectDelayMs, signal);
+        source = this.resumePipelineRunStream(runId, { after: lastSeq, signal });
       } catch (error) {
+        signal?.throwIfAborted();
         if (!runId || reconnects >= maxReconnects) {
           throw error;
         }
@@ -961,8 +991,8 @@ export class KitchenClient {
           if (terminal) return;
         }
 
-        await this.waitForReconnect(reconnectDelayMs);
-        source = this.resumePipelineRunStream(runId, { after: lastSeq });
+        await this.waitForReconnect(reconnectDelayMs, signal);
+        source = this.resumePipelineRunStream(runId, { after: lastSeq, signal });
       }
     }
   }
@@ -1120,7 +1150,9 @@ export class KitchenClient {
       apiKeyOverride,
       headers,
       agentMetadata,
+      signal,
     } = params;
+    signal?.throwIfAborted();
     const url = `${this.getBaseUrl()}/${recipeId}/${entryId}/stream`;
     const stringifiedBody = this.prepareBody(
       body,
@@ -1137,6 +1169,7 @@ export class KitchenClient {
         method: "POST",
         headers: await this.getHeaders(requestHeaders, forceRefresh),
         body: stringifiedBody,
+        ...(signal ? { signal } : {}),
       });
 
       if (!response.ok) {
@@ -1157,7 +1190,7 @@ export class KitchenClient {
           break;
         }
         sawMeaningfulEvent = true;
-        yield await this.hydrateTerminalEvent(event);
+        yield await this.hydrateTerminalEvent(event, signal);
       }
 
       if (retry) {

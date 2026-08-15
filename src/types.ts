@@ -238,6 +238,8 @@ export interface StreamParams {
   headers?: Record<string, string>;
   /** Optional parent agent/session metadata for durable run tracing */
   agentMetadata?: AgentRunMetadata;
+  /** Abort the active stream request and any resumable recovery requests. */
+  signal?: AbortSignal;
 }
 
 export interface PipelineRunFinalPayloadRef {
