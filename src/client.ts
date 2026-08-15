@@ -453,6 +453,7 @@ export class KitchenClient {
         ...(signal ? { signal } : {}),
       });
       const data = await this.parseResponse(response);
+      signal?.throwIfAborted();
       if (response.ok) {
         return data as T;
       }
@@ -754,7 +755,9 @@ export class KitchenClient {
     if (!response.ok) {
       throw new Error(`HTTP error! status: ${response.status}`);
     }
-    return await response.json() as KitchenResponse;
+    const payload = await response.json() as KitchenResponse;
+    options.signal?.throwIfAborted();
+    return payload;
   }
 
   async *resumePipelineRunStream(
@@ -773,6 +776,7 @@ export class KitchenClient {
 
       if (!response.ok) {
         const data = await this.parseResponse(response);
+        options.signal?.throwIfAborted();
         if (attempt === 0 && this.canRefreshAuthorization() &&
           this.shouldRetryAuthorization(response.status, data)) {
           forceRefresh = true;
@@ -815,6 +819,7 @@ export class KitchenClient {
   }
 
   private async hydrateTerminalEvent(event: StreamEvent, signal?: AbortSignal): Promise<StreamEvent> {
+    signal?.throwIfAborted();
     if (event.type !== "end" && event.type !== "error") {
       return event;
     }
@@ -839,9 +844,11 @@ export class KitchenClient {
       return data === event.data ? event : { ...event, data };
     }
 
+    const payload = await this.fetchPipelineRunFinalPayload(ref, { signal });
+    signal?.throwIfAborted();
     return {
       ...event,
-      data: await this.fetchPipelineRunFinalPayload(ref, { signal }),
+      data: payload,
     };
   }
 
@@ -941,8 +948,11 @@ export class KitchenClient {
     ): AsyncIterable<{ event: StreamEvent; terminal: boolean }> {
       signal?.throwIfAborted();
       const eventSnapshot = await self.getPipelineRunEvents(activeRunId, { after: lastSeq, signal });
+      signal?.throwIfAborted();
       for (const rawEvent of eventSnapshot.events || []) {
+        signal?.throwIfAborted();
         const event = await self.hydrateTerminalEvent(rawEvent, signal);
+        signal?.throwIfAborted();
         remember(event);
         yield { event, terminal: self.isTerminalStreamEvent(event) };
 
@@ -952,6 +962,7 @@ export class KitchenClient {
       }
 
       const status = await self.getPipelineRun(activeRunId, { signal });
+      signal?.throwIfAborted();
       if (self.isPipelineRunActive(status.status)) {
         return;
       }
@@ -959,6 +970,7 @@ export class KitchenClient {
       const finalPayload = status.finalPayloadRef
         ? await self.fetchPipelineRunFinalPayload(status.finalPayloadRef, { signal })
         : status;
+      signal?.throwIfAborted();
       const terminalEvent = self.buildTerminalEventFromRunStatus(
         activeRunId,
         status,
@@ -975,7 +987,9 @@ export class KitchenClient {
       try {
         let sawTerminal = false;
         for await (const rawEvent of source) {
+          signal?.throwIfAborted();
           const event = await this.hydrateTerminalEvent(rawEvent, signal);
+          signal?.throwIfAborted();
           remember(event);
           yield event;
 
@@ -1223,6 +1237,7 @@ export class KitchenClient {
 
       if (!response.ok) {
         const data = await this.parseResponse(response);
+        signal?.throwIfAborted();
         if (attempt === 0 && this.shouldRetryInitialRequest(response.status, data)) {
           forceRefresh = true;
           continue;

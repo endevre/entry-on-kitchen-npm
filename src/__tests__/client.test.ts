@@ -816,6 +816,73 @@ describe("KitchenClient", () => {
       });
     });
 
+    it("should not yield replay events parsed after abort", async () => {
+      const controller = new AbortController();
+      let resolveReplay!: (value: unknown) => void;
+      let markReplayParsing!: () => void;
+      const replayParsing = new Promise<void>((resolve) => {
+        markReplayParsing = resolve;
+      });
+      mockFetch
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          body: sseStream([
+            {
+              runId: "run-replay-abort",
+              seq: 1,
+              type: "progress",
+              time: 1,
+              data: { message: "started" },
+              statusCode: 200,
+            },
+          ]),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => {
+            markReplayParsing();
+            return new Promise((resolve) => {
+              resolveReplay = resolve;
+            });
+          },
+        });
+
+      const iterator = client.streamResumable({
+        recipeId: "test-recipe",
+        entryId: "test-entry",
+        body: { message: "Hello!" },
+        signal: controller.signal,
+      })[Symbol.asyncIterator]();
+
+      await expect(iterator.next()).resolves.toMatchObject({
+        value: { runId: "run-replay-abort", seq: 1 },
+        done: false,
+      });
+      const replaying = iterator.next();
+      await replayParsing;
+      controller.abort(new DOMException("Stopped during replay parsing", "AbortError"));
+      resolveReplay({
+        runId: "run-replay-abort",
+        events: [
+          {
+            runId: "run-replay-abort",
+            seq: 2,
+            type: "progress",
+            time: 2,
+            data: { message: "replayed" },
+            statusCode: 200,
+          },
+        ],
+        status: "running",
+      });
+
+      await expect(replaying).rejects.toMatchObject({
+        name: "AbortError",
+        message: "Stopped during replay parsing",
+      });
+    });
+
     it("should synthesize a terminal event from run status when stream events were already cleaned up", async () => {
       mockFetch
         .mockResolvedValueOnce({
@@ -969,6 +1036,59 @@ describe("KitchenClient", () => {
       await expect(nextEvent).rejects.toMatchObject({
         name: "AbortError",
         message: "Stopped during final hydration",
+      });
+    });
+
+    it("should not yield a terminal payload parsed after abort", async () => {
+      const controller = new AbortController();
+      let resolvePayload!: (value: unknown) => void;
+      let markPayloadParsing!: () => void;
+      const payloadParsing = new Promise<void>((resolve) => {
+        markPayloadParsing = resolve;
+      });
+      mockFetch
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          body: sseStream([
+            {
+              runId: "run-final-parse-abort",
+              seq: 1,
+              type: "end",
+              time: 1,
+              data: {
+                runId: "run-final-parse-abort",
+                status: "finished",
+                finalPayloadRef: { url: "https://signed.example/final-parse-abort.json" },
+              },
+              statusCode: 200,
+            },
+          ]),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => {
+            markPayloadParsing();
+            return new Promise((resolve) => {
+              resolvePayload = resolve;
+            });
+          },
+        });
+
+      const nextEvent = client.streamResumable({
+        recipeId: "test-recipe",
+        entryId: "test-entry",
+        body: { message: "Hello!" },
+        signal: controller.signal,
+      })[Symbol.asyncIterator]().next();
+
+      await payloadParsing;
+      controller.abort(new DOMException("Stopped during payload parsing", "AbortError"));
+      resolvePayload({ runId: "run-final-parse-abort", status: "finished", result: "done" });
+
+      await expect(nextEvent).rejects.toMatchObject({
+        name: "AbortError",
+        message: "Stopped during payload parsing",
       });
     });
   });

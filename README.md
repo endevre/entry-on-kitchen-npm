@@ -75,7 +75,6 @@ Execute a recipe synchronously and wait for the complete result.
 - `llmOverride` (string, optional): Override the LLM model (e.g., "gpt-4", "claude-3")
 - `thinkingOverride` (string, optional): Standardized runtime thinking level: `off`, `low`, `medium`, `high`, `xhigh`, or `max`
 - `apiKeyOverride` (object, optional): Override API keys for external services
-- `signal` (`AbortSignal`, optional): Cancel the active request and resumable recovery work
 
 **Returns:** `Promise<KitchenResponse>`
 
@@ -109,6 +108,7 @@ Execute a recipe with real-time streaming. Yields events as they arrive.
 - `llmOverride` (string, optional): Override the LLM model (e.g., "gpt-4", "claude-3")
 - `thinkingOverride` (string, optional): Standardized runtime thinking level: `off`, `low`, `medium`, `high`, `xhigh`, or `max`
 - `apiKeyOverride` (object, optional): Override API keys for external services
+- `signal` (`AbortSignal`, optional): Cancel the active request and resumable recovery work
 
 **Returns:** `AsyncIterable<StreamEvent>`
 
