@@ -134,7 +134,7 @@ export interface EntryCodeAuthorization {
 /** A bearer token provider. The provider is called before every request attempt. */
 export interface BearerAuthorization {
   kind: "bearer";
-  getToken: (options: { forceRefresh: boolean }) => Promise<string>;
+  getToken: (options: { forceRefresh: boolean; signal?: AbortSignal }) => Promise<string>;
 }
 
 /** Authentication capability used by KitchenClient. */
@@ -238,6 +238,8 @@ export interface StreamParams {
   headers?: Record<string, string>;
   /** Optional parent agent/session metadata for durable run tracing */
   agentMetadata?: AgentRunMetadata;
+  /** Abort the active stream request and any resumable recovery requests. */
+  signal?: AbortSignal;
 }
 
 export interface PipelineRunFinalPayloadRef {
