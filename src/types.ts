@@ -134,7 +134,7 @@ export interface EntryCodeAuthorization {
 /** A bearer token provider. The provider is called before every request attempt. */
 export interface BearerAuthorization {
   kind: "bearer";
-  getToken: (options: { forceRefresh: boolean }) => Promise<string>;
+  getToken: (options: { forceRefresh: boolean; signal?: AbortSignal }) => Promise<string>;
 }
 
 /** Authentication capability used by KitchenClient. */

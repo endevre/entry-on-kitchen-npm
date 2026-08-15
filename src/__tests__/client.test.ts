@@ -479,6 +479,49 @@ describe("KitchenClient", () => {
       await expect(consuming).rejects.toMatchObject({ name: "AbortError", message: "Stopped by user" });
     });
 
+    it("should not yield buffered events after abort", async () => {
+      const controller = new AbortController();
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        body: sseStream([
+          {
+            runId: "run-buffered",
+            seq: 1,
+            type: "progress",
+            time: 1,
+            data: { message: "first" },
+            statusCode: 200,
+          },
+          {
+            runId: "run-buffered",
+            seq: 2,
+            type: "progress",
+            time: 2,
+            data: { message: "second" },
+            statusCode: 200,
+          },
+        ]),
+      });
+
+      const iterator = client.stream({
+        recipeId: "test-recipe",
+        entryId: "test-entry",
+        body: { message: "Hello!" },
+        signal: controller.signal,
+      })[Symbol.asyncIterator]();
+
+      await expect(iterator.next()).resolves.toMatchObject({
+        value: { runId: "run-buffered", seq: 1 },
+        done: false,
+      });
+      controller.abort(new DOMException("Stopped with buffered output", "AbortError"));
+      await expect(iterator.next()).rejects.toMatchObject({
+        name: "AbortError",
+        message: "Stopped with buffered output",
+      });
+    });
+
     it("should handle different event types", async () => {
       const streamData =
         '{"runId":"test-id","type":"progress","time":123456,"data":{"blockPosition":1,"blocksToExitBlock":3},"socket":null,"statusCode":200}' +
@@ -878,6 +921,56 @@ describe("KitchenClient", () => {
       });
       expect(mockFetch).toHaveBeenCalledWith("https://signed.example/final-url-only.json");
     });
+
+    it("should abort terminal payload hydration", async () => {
+      const controller = new AbortController();
+      let payloadSignal: AbortSignal | null | undefined;
+      let markPayloadFetchStarted!: () => void;
+      const payloadFetchStarted = new Promise<void>((resolve) => {
+        markPayloadFetchStarted = resolve;
+      });
+      mockFetch
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          body: sseStream([
+            {
+              runId: "run-final-abort",
+              seq: 1,
+              type: "end",
+              time: 1,
+              data: {
+                runId: "run-final-abort",
+                status: "finished",
+                finalPayloadRef: { url: "https://signed.example/final-abort.json" },
+              },
+              statusCode: 200,
+            },
+          ]),
+        })
+        .mockImplementationOnce((_url, init?: RequestInit) => {
+          payloadSignal = init?.signal;
+          markPayloadFetchStarted();
+          return new Promise((_resolve, reject) => {
+            payloadSignal?.addEventListener("abort", () => reject(payloadSignal?.reason), { once: true });
+          });
+        });
+
+      const nextEvent = client.streamResumable({
+        recipeId: "test-recipe",
+        entryId: "test-entry",
+        body: { message: "Hello!" },
+        signal: controller.signal,
+      })[Symbol.asyncIterator]().next();
+
+      await payloadFetchStarted;
+      expect(payloadSignal).toBe(controller.signal);
+      controller.abort(new DOMException("Stopped during final hydration", "AbortError"));
+      await expect(nextEvent).rejects.toMatchObject({
+        name: "AbortError",
+        message: "Stopped during final hydration",
+      });
+    });
   });
 
   describe("authorization", () => {
@@ -917,6 +1010,43 @@ describe("KitchenClient", () => {
           Authorization: "raw-token",
         },
       }));
+    });
+
+    it("passes stream cancellation to bearer token acquisition", async () => {
+      const controller = new AbortController();
+      let tokenSignal: AbortSignal | undefined;
+      let markTokenRequested!: () => void;
+      const tokenRequested = new Promise<void>((resolve) => {
+        markTokenRequested = resolve;
+      });
+      const getToken = vi.fn(({ signal }: { forceRefresh: boolean; signal?: AbortSignal }) => {
+        tokenSignal = signal;
+        markTokenRequested();
+        return new Promise<string>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      });
+      client = new KitchenClient({ authorization: { kind: "bearer", getToken } });
+
+      const consuming = (async () => {
+        for await (const _event of client.stream({
+          recipeId: "recipe",
+          entryId: "entry",
+          body: {},
+          signal: controller.signal,
+        })) {
+          // Token acquisition remains pending until cancellation.
+        }
+      })();
+
+      await tokenRequested;
+      expect(tokenSignal).toBe(controller.signal);
+      controller.abort(new DOMException("Stopped before authorization", "AbortError"));
+      await expect(consuming).rejects.toMatchObject({
+        name: "AbortError",
+        message: "Stopped before authorization",
+      });
+      expect(mockFetch).not.toHaveBeenCalled();
     });
 
     it("refreshes and retries exactly once after an HTTP 401", async () => {

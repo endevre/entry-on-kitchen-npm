@@ -205,15 +205,22 @@ export class KitchenClient {
     return normalized === "authorization" || normalized === "x-entry-auth-code";
   }
 
-  private async getAuthorizationValue(forceRefresh = false): Promise<HeadersObject> {
+  private async getAuthorizationValue(
+    forceRefresh = false,
+    signal?: AbortSignal,
+  ): Promise<HeadersObject> {
+    signal?.throwIfAborted();
     if (this.authorization.kind === "entry_code") {
       return { "X-Entry-Auth-Code": this.authorization.code };
     }
 
     let token: string;
     try {
-      token = await this.authorization.getToken({ forceRefresh });
+      token = await this.authorization.getToken(
+        signal ? { forceRefresh, signal } : { forceRefresh },
+      );
     } catch {
+      signal?.throwIfAborted();
       throw new KitchenAuthorizationError();
     }
 
@@ -233,6 +240,7 @@ export class KitchenClient {
   private async getHeaders(
     customHeaders?: Record<string, string>,
     forceRefresh = false,
+    signal?: AbortSignal,
   ): Promise<HeadersObject> {
     const headers: HeadersObject = {
       "Content-Type": "application/json",
@@ -246,7 +254,7 @@ export class KitchenClient {
       }
     }
 
-    Object.assign(headers, await this.getAuthorizationValue(forceRefresh));
+    Object.assign(headers, await this.getAuthorizationValue(forceRefresh, signal));
     return headers;
   }
 
@@ -441,7 +449,7 @@ export class KitchenClient {
       signal?.throwIfAborted();
       const response = await fetch(url, {
         method: "GET",
-        headers: await this.getHeaders(undefined, forceRefresh),
+        headers: await this.getHeaders(undefined, forceRefresh, signal),
         ...(signal ? { signal } : {}),
       });
       const data = await this.parseResponse(response);
@@ -504,7 +512,10 @@ export class KitchenClient {
     return this.isAuthorizationExpiredPayload(data);
   }
 
-  private async *readSseResponse(response: Response): AsyncIterable<StreamEvent> {
+  private async *readSseResponse(
+    response: Response,
+    signal?: AbortSignal,
+  ): AsyncIterable<StreamEvent> {
     if (!response.ok) {
       throw new Error(`HTTP error! status: ${response.status}`);
     }
@@ -517,7 +528,9 @@ export class KitchenClient {
     let buffer = "";
     try {
       while (true) {
+        signal?.throwIfAborted();
         const { done, value } = await reader.read();
+        signal?.throwIfAborted();
         if (value) {
           buffer += decoder.decode(value, { stream: true });
         }
@@ -527,17 +540,30 @@ export class KitchenClient {
           const frame = buffer.slice(0, boundary);
           buffer = buffer.slice(buffer[boundary] === "\r" ? boundary + 4 : boundary + 2);
           const event = this.parseSseFrame(frame);
-          if (event) yield event;
+          if (event) {
+            signal?.throwIfAborted();
+            yield event;
+          }
           boundary = buffer.search(/\r?\n\r?\n/);
         }
 
         if (done) {
           const event = this.parseSseFrame(buffer);
-          if (event) yield event;
+          if (event) {
+            signal?.throwIfAborted();
+            yield event;
+          }
           break;
         }
       }
     } finally {
+      if (signal?.aborted) {
+        try {
+          await reader.cancel(signal.reason);
+        } catch {
+          // The fetch implementation may already have cancelled the reader.
+        }
+      }
       reader.releaseLock();
     }
   }
@@ -741,7 +767,7 @@ export class KitchenClient {
     for (let attempt = 0; attempt < 2; attempt++) {
       const response = await fetch(`${this.getBaseUrl()}/resumestream/${runId}?${params.toString()}`, {
         method: "GET",
-        headers: await this.getHeaders(undefined, forceRefresh),
+        headers: await this.getHeaders(undefined, forceRefresh, options.signal),
         ...(options.signal ? { signal: options.signal } : {}),
       });
 
@@ -757,7 +783,8 @@ export class KitchenClient {
 
       let sawMeaningfulEvent = false;
       let retry = false;
-      for await (const event of this.readSseResponse(response)) {
+      for await (const event of this.readSseResponse(response, options.signal)) {
+        options.signal?.throwIfAborted();
         if (!sawMeaningfulEvent && this.isAuthorizationFailureEvent(event) &&
           attempt === 0 && this.canRefreshAuthorization()) {
           retry = true;
@@ -857,6 +884,7 @@ export class KitchenClient {
     await new Promise<void>((resolve, reject) => {
       const onAbort = () => {
         clearTimeout(timeout);
+        signal?.removeEventListener("abort", onAbort);
         reject(signal?.reason ?? new DOMException("The operation was aborted", "AbortError"));
       };
       const timeout = setTimeout(() => {
@@ -1022,7 +1050,10 @@ export class KitchenClient {
    * }
    * ```
    */
-  private async *readRecipeStream(response: Response): AsyncIterable<StreamEvent> {
+  private async *readRecipeStream(
+    response: Response,
+    signal?: AbortSignal,
+  ): AsyncIterable<StreamEvent> {
     // The API returns either Server-Sent Events with a "data:" prefix or raw
     // concatenated JSON objects. Keep both formats for compatibility.
     const reader = response.body?.getReader();
@@ -1077,19 +1108,25 @@ export class KitchenClient {
     ): AsyncIterable<StreamEvent> {
       const parsed = self.parseStreamEvent(value);
       if (parsed) {
+        signal?.throwIfAborted();
         yield parsed;
         return;
       }
       if (!extractObjects) return;
       for (const objectString of extractCompleteJsonObjects(value)) {
         const object = self.parseStreamEvent(objectString);
-        if (object) yield object;
+        if (object) {
+          signal?.throwIfAborted();
+          yield object;
+        }
       }
     };
 
     try {
       while (true) {
+        signal?.throwIfAborted();
         const { done, value } = await reader.read();
+        signal?.throwIfAborted();
         if (value) buffer += decoder.decode(value, { stream: true });
 
         if (done) {
@@ -1097,6 +1134,7 @@ export class KitchenClient {
             for (const line of buffer.split("data:")) {
               const trimmed = line.trim();
               if (!trimmed) continue;
+              signal?.throwIfAborted();
               yield* parseAndYield(this, trimmed, true);
             }
           }
@@ -1112,7 +1150,10 @@ export class KitchenClient {
 
           for (let i = 0; i < linesToProcess; i++) {
             const line = lines[i].trim();
-            if (line) yield* parseAndYield(this, line, true);
+            if (line) {
+              signal?.throwIfAborted();
+              yield* parseAndYield(this, line, true);
+            }
             processedChars += line.length + 5;
           }
 
@@ -1127,6 +1168,7 @@ export class KitchenClient {
           for (const objectString of objects) {
             const object = this.parseStreamEvent(objectString);
             if (object) {
+              signal?.throwIfAborted();
               yield object;
               lastEndIdx += objectString.length;
             }
@@ -1135,6 +1177,13 @@ export class KitchenClient {
         }
       }
     } finally {
+      if (signal?.aborted) {
+        try {
+          await reader.cancel(signal.reason);
+        } catch {
+          // The fetch implementation may already have cancelled the reader.
+        }
+      }
       reader.releaseLock();
     }
   }
@@ -1167,7 +1216,7 @@ export class KitchenClient {
     for (let attempt = 0; attempt < 2; attempt++) {
       const response = await fetch(url, {
         method: "POST",
-        headers: await this.getHeaders(requestHeaders, forceRefresh),
+        headers: await this.getHeaders(requestHeaders, forceRefresh, signal),
         body: stringifiedBody,
         ...(signal ? { signal } : {}),
       });
@@ -1183,7 +1232,8 @@ export class KitchenClient {
 
       let sawMeaningfulEvent = false;
       let retry = false;
-      for await (const event of this.readRecipeStream(response)) {
+      for await (const event of this.readRecipeStream(response, signal)) {
+        signal?.throwIfAborted();
         if (!sawMeaningfulEvent && attempt === 0 && this.canRefreshAuthorization() &&
           this.isAuthorizationFailureEvent(event)) {
           retry = true;
